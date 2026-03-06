@@ -1,0 +1,8 @@
+planner:
+  # D: Short-horizon + robust bias scope
+  z_ar_mode: first_step
+  use_step_pooled_tokens: true
+  use_spatial_tokens: true
+  use_time_aligned_bias: true
+  time_aligned_bias_strength: 1.0
+  time_aligned_bias_scope: pooled_only

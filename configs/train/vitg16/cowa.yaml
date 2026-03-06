@@ -1,0 +1,122 @@
+app: vjepa_cowa_planner
+cpus_per_task: 12
+folder: /disk/deepdata/hch_workspace/code/vjepa2/results/cowa/vitg16-256px-8f_hf_planner_mm_fintune_predictor_encoder
+mem_per_gpu: 81G
+nodes: 1
+tasks_per_node: 8
+data:
+  batch_size: 1
+  camera_views:
+  - CAM_FRONT
+  crop_size: 256
+  datasets:
+    # CSV file, each line is a trajectory dir path
+    - /disk/deepdata/dataset/vjepa_format_ad_data/train_front_split.txt
+  # 验证数据集配置
+  val_datasets:
+    - /disk/deepdata/dataset/vjepa_format_ad_data/val_front_split.txt
+  dataset_fpcs:
+  - 8
+  fps: 4
+  num_workers: 8
+  patch_size: 16
+  # num_context_frames: 16    # 新增：context帧数
+  num_target_frames: 8    # 新增：target帧数
+  pin_mem: true
+  stereo_view: false
+  tubelet_size: 2
+data_aug:
+  auto_augment: false
+  horizontal_flip: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 1.777
+  - 1.777
+  reprob: 0.0
+loss:
+  auto_steps: 16
+  loss_exp: 1.0
+  normalize_reps: true
+  reg_coeff: 0.0
+meta:
+  dtype: bfloat16
+  eval_freq: 100
+  val_freq: 5  # 每隔5个epoch执行验证
+  resume_checkpoint: null
+  load_predictor: true
+  load_encoder: true  # 是否加载 encoder 权重
+  load_seg: true  # 是否加载 seg 权重
+  load_planner: true  # 是否加载 planner 权重
+  pretrain_checkpoint: /disk/deepdata/hch_workspace/pretrained/vjepa/vjepa2-vitg-fpc64-256/model.safetensors
+  # 包含 encoder, predictor, seg 的预训练 checkpoint
+  pretrain_checkpoint_full: /disk/deepdata/hch_workspace/code/vjepa2/results/cowa/vitg16-256px-8f_hf_planner_mm_train_predictor/latest.pt
+  pretrain_repo: /disk/deepdata/hch_workspace/pretrained/vjepa/vjepa2-vitg-fpc64-256/
+  context_encoder_key: target_encoder
+  target_encoder_key: target_encoder
+  save_every_freq: 25
+  seed: 239
+  use_sdpa: true
+model:
+  model_name: vit_giant_xformers
+  pred_depth: 24
+  pred_embed_dim: 1024
+  pred_is_frame_causal: true
+  pred_num_heads: 16
+  uniform_power: true
+  use_activation_checkpointing: true
+  use_extrinsics: false
+  use_rope: true
+optimization:
+  anneal: 15
+  epochs: 315
+  final_lr: 0.0
+  final_weight_decay: 0.04
+  enc_lr_scale: 1
+  ipe: 300
+  lr: 0.000425
+  start_lr: 0.000075
+  warmup: 15
+  weight_decay: 0.04
+ema:
+  use_ema: true
+  perceiver_target_frame: 8
+  perceiver_target_hw: 8
+  perceiver_depth: 5
+  perceiver_num_heads: 16
+  perceiver_head_dim: 64
+  ema_start: 0.996  # EMA 动态 momentum 起始值
+  ema_end: 0.999    # EMA 动态 momentum 结束值
+segmentation:
+  use_segmentation: false
+  seg_data_root: "/disk/deepdata/dataset/nvs/data/mask_labeling/clip_image_nvs_panorama_EQ5S/0-10000"
+  seg_loss_weight: 1
+  loss_weights: {
+        "loss_mask": 5.0,
+        "loss_dice": 5.0,
+  }
+train:
+  encoder_train: false
+  student_perceiver: false
+  seg_head: false  # 冻结 seg 部分
+  encoder_ema: false
+  perceiver_ema: false
+  predictor_train: true
+planner:
+  use_planner: false
+  tf_d_model: 256
+  tf_d_ffn: 1024
+  tf_num_layers: 3
+  tf_num_head: 8
+  tf_dropout: 0.0
+  planner_loss_weight: 0.5
+  use_spatial_tokens: True
+  num_modes: 6
+  status_mode: "first"
+  conf_loss_weight: 0.5
+  reg_loss_weight: 1.0
+  wta_loss_version: v1  # 可选: v1 或 v2
+  wta_temperature: 1.0  # v2专用: 软标签温度参数
+  cover_loss_weight: 0.1  # v2专用: Cover损失权重

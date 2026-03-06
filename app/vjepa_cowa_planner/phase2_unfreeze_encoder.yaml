@@ -1,0 +1,52 @@
+# ============================================================================
+# Phase 2: 解冻 Encoder 端到端微调
+# 基于 Phase 1 (冻结 encoder, 100 epoch) 的 checkpoint 继续训练
+# ============================================================================
+
+train:
+  encoder_train: true
+  encoder_ema: true
+  predictor_train: true
+  seg_head: true
+  student_perceiver: true
+
+ema:
+  use_ema: true
+  perceiver_num_latents: 128
+  perceiver_depth: 5
+  perceiver_num_heads: 16
+  perceiver_head_dim: 64
+  # Phase 2 EMA: 极高的 momentum 保护 target_encoder 稳定性
+  ema_start: 0.9998
+  ema_end: 0.99999
+  resample_size: 16
+
+optimization:
+  epochs: 50
+  # 基础学习率: Phase 1 的 1/5 ~ 1/10
+  lr: 1.0e-5
+  start_lr: 1.0e-7
+  final_lr: 1.0e-7
+  # encoder 学习率 = lr * enc_lr_scale = 1e-5 * 0.01 = 1e-7
+  enc_lr_scale: 0.01
+  warmup: 5
+  anneal: 15
+  weight_decay: 0.05
+  final_weight_decay: 0.05
+
+meta:
+  # 改为你 Phase 1 保存的 checkpoint 路径
+  pretrain_checkpoint_full: "/path/to/phase1_epoch100.pt"
+  load_encoder: true
+  load_predictor: true
+  load_seg: true
+  load_planner: true
+  save_every_freq: 5
+  val_freq: 5
+
+planner:
+  use_planner: true
+  planner_loss_weight: 1.0
+  # Phase 2: 允许 planner loss 的梯度回传到 encoder
+  planner_grad_to_encoder: false
+  wta_loss_version: v1

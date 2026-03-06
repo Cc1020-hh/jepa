@@ -31,6 +31,7 @@ from torch.nn.parallel import DistributedDataParallel
 from app.vjepa_droid.droid import init_data
 from app.vjepa_droid.transforms import make_transforms
 from app.vjepa_droid.utils import init_opt, init_video_model, load_checkpoint, load_pretrained
+from app.vjepa_droid.z_ar_trajectory_branch import ZArTrajectoryBranch
 from src.utils.distributed import init_distributed
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
 
@@ -97,6 +98,11 @@ def main(args, resume_preempt=False):
     use_pred_silu = cfgs_model.get("use_pred_silu", False)
     wide_silu = cfgs_model.get("wide_silu", True)
     use_extrinsics = cfgs_model.get("use_extrinsics", False)
+    # Trajectory branch (z_ar -> trajectory head)
+    traj_num_poses = cfgs_model.get("traj_num_poses", 8)
+    traj_d_model = cfgs_model.get("traj_d_model", 256)
+    traj_d_ffn = cfgs_model.get("traj_d_ffn", 1024)
+    traj_decoder_type = cfgs_model.get("traj_decoder_type", "spatial_pool")
 
     # -- DATA
     cfgs_data = args.get("data")
@@ -130,6 +136,10 @@ def main(args, resume_preempt=False):
     loss_exp = cfgs_loss.get("loss_exp")
     normalize_reps = cfgs_loss.get("normalize_reps")
     auto_steps = min(cfgs_loss.get("auto_steps", 1), max_num_frames)
+    use_trajectory_branch = cfgs_loss.get("use_trajectory_branch", False)
+    trajectory_weight = cfgs_loss.get("trajectory_weight", 1.0)
+    # Indices into states [B,T,7] for (x, y, θ): default (0, 1, 5) for DROID (x, y, euler_z)
+    traj_target_indices = cfgs_loss.get("traj_target_indices", [0, 1, 5])
     # --
     tokens_per_frame = int((crop_size // patch_size) ** 2)
 
@@ -212,6 +222,21 @@ def main(args, resume_preempt=False):
     )
     target_encoder = copy.deepcopy(encoder)
 
+    # -- Trajectory branch: z_ar as keyval, query cross-attends -> trajectory_head
+    trajectory_branch = None
+    if use_trajectory_branch:
+        z_ar_dim = encoder.embed_dim  # predictor outputs to encoder dim
+        trajectory_branch = ZArTrajectoryBranch(
+            z_ar_dim=z_ar_dim,
+            tokens_per_frame=tokens_per_frame,
+            num_poses=traj_num_poses,
+            auto_steps=auto_steps,
+            d_model=traj_d_model,
+            d_ffn=traj_d_ffn,
+            decoder_type=traj_decoder_type,
+        ).to(device)
+        logger.info(f"Trajectory branch: {traj_num_poses} poses, d_model={traj_d_model}, decoder={traj_decoder_type}")
+
     if compile_model:
         logger.info("Compiling encoder, target_encoder, and predictor.")
         torch._dynamo.config.optimize_ddp = False
@@ -257,6 +282,7 @@ def main(args, resume_preempt=False):
     optimizer, scaler, scheduler, wd_scheduler = init_opt(
         encoder=encoder,
         predictor=predictor,
+        trajectory_branch=trajectory_branch,
         wd=wd,
         final_wd=final_wd,
         start_lr=start_lr,
@@ -273,6 +299,8 @@ def main(args, resume_preempt=False):
     )
     encoder = DistributedDataParallel(encoder, static_graph=True)
     predictor = DistributedDataParallel(predictor, static_graph=False, find_unused_parameters=True)
+    if trajectory_branch is not None:
+        trajectory_branch = DistributedDataParallel(trajectory_branch)
     target_encoder = DistributedDataParallel(target_encoder)
     for p in target_encoder.parameters():
         p.requires_grad = False
@@ -306,6 +334,7 @@ def main(args, resume_preempt=False):
             target_encoder=target_encoder,
             opt=optimizer,
             scaler=scaler,
+            trajectory_branch=trajectory_branch,
         )
         for _ in range(start_epoch * ipe):
             scheduler.step()
@@ -321,11 +350,15 @@ def main(args, resume_preempt=False):
             "scaler": None if scaler is None else scaler.state_dict(),
             "target_encoder": target_encoder.state_dict(),
             "epoch": epoch,
+        }
+        if trajectory_branch is not None:
+            save_dict["trajectory_branch"] = trajectory_branch.state_dict()
+        save_dict.update({
             "loss": loss_meter.avg,
             "batch_size": batch_size,
             "world_size": world_size,
             "lr": lr,
-        }
+        })
         try:
             torch.save(save_dict, path)
         except Exception as e:
@@ -359,6 +392,7 @@ def main(args, resume_preempt=False):
         loss_meter = AverageMeter()
         jloss_meter = AverageMeter()
         sloss_meter = AverageMeter()
+        tloss_meter = AverageMeter()
         iter_time_meter = AverageMeter()
         gpu_time_meter = AverageMeter()
         data_elapsed_time_meter = AverageMeter()
@@ -440,6 +474,23 @@ def main(args, resume_preempt=False):
                     _h = h[:, tokens_per_frame : z.size(1) + tokens_per_frame]
                     return torch.mean(torch.abs(z - _h) ** loss_exp) / loss_exp
 
+                def build_trajectory_target(states):
+                    """Build [B, num_poses, 3] from states using traj_target_indices (x, y, θ)."""
+                    B, T, S = states.shape
+                    idx = [i for i in traj_target_indices if i < S]
+                    if len(idx) < 3:
+                        idx = idx + [0] * (3 - len(idx))  # pad with 0 for missing dims
+                    idx = idx[:3]
+                    n_avail = min(T - 1, traj_num_poses)
+                    tgt = states[:, 1 : 1 + n_avail, idx]  # [B, n_avail, 3]
+                    if n_avail < traj_num_poses:
+                        pad = torch.zeros(
+                            B, traj_num_poses - n_avail, 3,
+                            device=tgt.device, dtype=tgt.dtype
+                        )
+                        tgt = torch.cat([tgt, pad], dim=1)
+                    return tgt[:, :traj_num_poses]
+
                 # Step 1. Forward
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
                     h = forward_target(clips)
@@ -447,6 +498,14 @@ def main(args, resume_preempt=False):
                     jloss = loss_fn(z_tf, h)
                     sloss = loss_fn(z_ar, h)
                     loss = jloss + sloss
+
+                    tloss = 0.0
+                    if trajectory_branch is not None:
+                        traj_out = trajectory_branch(z_ar, tokens_per_frame=tokens_per_frame)
+                        traj_pred = traj_out["trajectory"]
+                        traj_target = build_trajectory_target(states)
+                        tloss = F.l1_loss(traj_pred, traj_target)
+                        loss = loss + trajectory_weight * tloss
 
                 # Step 2. Backward & step
                 if mixed_precision:
@@ -465,6 +524,7 @@ def main(args, resume_preempt=False):
                     float(loss),
                     float(jloss),
                     float(sloss),
+                    float(tloss) if trajectory_branch is not None else 0.0,
                     _new_lr,
                     _new_wd,
                 )
@@ -473,6 +533,7 @@ def main(args, resume_preempt=False):
                 loss,
                 jloss,
                 sloss,
+                tloss,
                 _new_lr,
                 _new_wd,
             ), gpu_etime_ms = gpu_timer(train_step)
@@ -480,6 +541,7 @@ def main(args, resume_preempt=False):
             loss_meter.update(loss)
             jloss_meter.update(jloss)
             sloss_meter.update(sloss)
+            tloss_meter.update(tloss)
             iter_time_meter.update(iter_elapsed_time_ms)
             gpu_time_meter.update(gpu_etime_ms)
             data_elapsed_time_meter.update(data_elapsed_time_ms)
@@ -488,8 +550,9 @@ def main(args, resume_preempt=False):
             def log_stats():
                 csv_logger.log(epoch + 1, itr, loss, iter_elapsed_time_ms, gpu_etime_ms, data_elapsed_time_ms)
                 if (itr % log_freq == 0) or (itr == ipe - 1) or np.isnan(loss) or np.isinf(loss):
+                    log_traj = f" [traj: %.3f]" % tloss_meter.avg if trajectory_branch is not None else ""
                     logger.info(
-                        "[%d, %5d] loss: %.3f [%.2f, %.2f] "
+                        "[%d, %5d] loss: %.3f [%.2f, %.2f]%s "
                         "[wd: %.2e] [lr: %.2e] "
                         "[mem: %.2e] "
                         "[iter: %.1f ms] "
@@ -501,6 +564,7 @@ def main(args, resume_preempt=False):
                             loss_meter.avg,
                             jloss_meter.avg,
                             sloss_meter.avg,
+                            log_traj,
                             _new_wd,
                             _new_lr,
                             torch.cuda.max_memory_allocated() / 1024.0**2,

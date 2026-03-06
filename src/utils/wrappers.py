@@ -34,10 +34,14 @@ class PredictorMultiSeqWrapper(nn.Module):
         self.backbone = backbone
 
     def forward(self, x, masks_x, masks_y, has_cls=False):
+        # Global mask-token index over all (fpc, mask-config) pairs.
+        # This ensures mask_tokens are used as:
+        #   idx = fpc_idx * num_mask_cfgs + mask_cfg_idx
+        # when each fpc has the same number of mask configs.
         n = 0
         outs = [[] for _ in x]
         for i, (xi, mxi, myi) in enumerate(zip(x, masks_x, masks_y)):
             for xij, mxij, myij in zip(xi, mxi, myi):
-                outs[i] += [self.backbone(xij, mxij, myij, mask_index=i, has_cls=has_cls)]
+                outs[i] += [self.backbone(xij, mxij, myij, mask_index=n, has_cls=has_cls)]
                 n += 1
         return outs
