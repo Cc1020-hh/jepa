@@ -3,10 +3,10 @@
 
 import os
 
-try:
-    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
-except Exception:
-    pass
+# try:
+    # os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
+# except Exception:
+    # pass
 
 import copy
 import gc
@@ -28,7 +28,7 @@ from app.vjepa_droid.transforms import make_transforms
 from app.vjepa_droid.utils import init_opt, init_opt_resample_world_model,init_opt_no_resample_world_model, load_checkpoint, load_pretrained, load_pretrained_safetensors,init_predictor_model
 from app.vjepa.utils import init_video_model as init_video_model_vjepa
 from src.utils.distributed import init_distributed
-from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
+from src.utils.logging import AverageMeter, TableLogger, get_logger, gpu_timer
 from app.vjepa_cowa.RopeResample import RoPEPerceiverResampler
 from torch.utils.tensorboard import SummaryWriter
 from app.vjepa_cowa.seg_neck2 import SFP
@@ -81,13 +81,14 @@ class MultiModalTemporalPlanner(nn.Module):
         tokens_per_frame: int = 256,
         num_poses: int = 7,
         num_time_steps: int = 7,
-        status_dim: int = 8,
+        status_dim: int = 7,
         use_spatial_tokens: bool = False,
         num_modes: int = 6,
         use_temporal: bool = False,
         use_time_aligned_bias: bool = True,
         time_aligned_bias_strength: float = 5.0,  # 初始值，会作为可学习参数的初始化
         use_z_context: bool = False,
+        use_status: bool = True,  # 是否使用 status 特征
     ):
         super().__init__()
 
@@ -101,6 +102,7 @@ class MultiModalTemporalPlanner(nn.Module):
         self.use_temporal = use_temporal
         self.use_time_aligned_bias = use_time_aligned_bias
         self.use_z_context = use_z_context
+        self.use_status = use_status
 
         # ==================== 时序对齐：可学习的 bias 强度 ====================
         # 将 strength 设为可学习参数，让模型自己学习最合适的时序约束强度
@@ -162,7 +164,11 @@ class MultiModalTemporalPlanner(nn.Module):
             num_kv = (tokens_per_frame if use_spatial_tokens else 1) * num_time_steps + 1
             self.temporal_embedding = nn.Embedding(num_kv, tf_d_model)
 
-            self.status_encoding = nn.Linear(status_dim, tf_d_model)
+            self.status_encoding = nn.Sequential(
+                nn.Linear(status_dim, 128),
+                nn.ReLU(),
+                nn.Linear(128, tf_d_model),
+            )
         else:
             if use_spatial_tokens:
                 self.image_fc = nn.Linear(encoder_dim, tf_d_model)
@@ -225,18 +231,22 @@ class MultiModalTemporalPlanner(nn.Module):
 
         feat = feat + self.temporal_embedding.weight[:T_feat].unsqueeze(0)
 
-        status = self.status_encoding(status_feature).unsqueeze(1)
-        status = status + self.temporal_embedding.weight[T_feat:T_feat + 1].unsqueeze(0)
+        if self.use_status:
+            status = self.status_encoding(status_feature).unsqueeze(1)
+            status = status + self.temporal_embedding.weight[T_feat:T_feat + 1].unsqueeze(0)
 
-        # Status token 的时间步索引设为 -1，表示"不参与时序对齐"
-        # 在 _build_time_aligned_memory_bias 中会对 idx=-1 的 token 特殊处理
-        status_step_idx = torch.full((1,), -1, device=z_ar.device, dtype=torch.long)
-        memory_step_idx = torch.cat([memory_step_idx, status_step_idx], dim=0)
+            # Status token 的时间步索引设为 -1，表示"不参与时序对齐"
+            # 在 _build_time_aligned_memory_bias 中会对 idx=-1 的 token 特殊处理
+            status_step_idx = torch.full((1,), -1, device=z_ar.device, dtype=torch.long)
+            memory_step_idx = torch.cat([memory_step_idx, status_step_idx], dim=0)
 
-        # 返回 memory 序列及其对应的时间步索引
-        # memory: [B, T*P+1 或 T+1, d] - 最后一个是 status token
-        # memory_step_idx: [T*P+1 或 T+1] - 每个位置的时间步索引
-        return torch.cat([feat, status], dim=1), memory_step_idx
+            # 返回 memory 序列及其对应的时间步索引
+            # memory: [B, T*P+1 或 T+1, d] - 最后一个是 status token
+            # memory_step_idx: [T*P+1 或 T+1] - 每个位置的时间步索引
+            return torch.cat([feat, status], dim=1), memory_step_idx
+        else:
+            # 不使用 status 时直接返回 feat
+            return feat, memory_step_idx
 
     # ─────────────────────────────────────────────────────────────────
     def _build_memory_single(
@@ -256,10 +266,13 @@ class MultiModalTemporalPlanner(nn.Module):
             img_feat = self.image_fc(z_pooled)
             img_feat = img_feat.unsqueeze(1)
 
-        status_encoded = self.status_encoding(status_feature)
-        status_encoded = status_encoded.unsqueeze(1)
+        if self.use_status:
+            status_encoded = self.status_encoding(status_feature)
+            status_encoded = status_encoded.unsqueeze(1)
 
-        keyval = torch.cat([img_feat, status_encoded], dim=1)
+            keyval = torch.cat([img_feat, status_encoded], dim=1)
+        else:
+            keyval = img_feat
 
         num_keyval = keyval.shape[1]
         keyval = keyval + self.keyval_embedding.weight[:num_keyval, :].unsqueeze(0)
@@ -301,8 +314,11 @@ class MultiModalTemporalPlanner(nn.Module):
         Q = query_step_idx.shape[0]
         M = memory_step_idx.shape[0]
 
+        # 计算实际的 time_aligned_bias_strength (从 log 空间转换)
+        time_aligned_bias_strength = torch.exp(self.log_time_aligned_bias_strength)
+
         # 如果未启用时序对齐，返回全零 bias（无约束）
-        if (not self.use_time_aligned_bias) or self.time_aligned_bias_strength <= 0:
+        if (not self.use_time_aligned_bias) or time_aligned_bias_strength <= 0:
             return torch.zeros(Q, M, device=query_step_idx.device, dtype=dtype)
 
         # 广播计算时间步距离矩阵
@@ -316,7 +332,7 @@ class MultiModalTemporalPlanner(nn.Module):
 
         # 计算 bias: 距离越远，bias 越负（惩罚越大）
         # distance=0 -> bias=0, distance=norm -> bias=-strength
-        bias = -self.time_aligned_bias_strength * (distance / norm)  # [Q, M]
+        bias = -time_aligned_bias_strength * (distance / norm)  # [Q, M]
 
         # 特殊处理：status token (idx=-1) 不参与时序对齐，bias 设为 0
         status_mask = memory_step_idx.eq(-1).unsqueeze(0)    # [1, M]
@@ -647,6 +663,151 @@ def wta_loss_v2(
         "cover_loss": cover_loss,
         "winner_idx": winner_idx,
     }
+
+
+def wta_loss_v3(
+    pred_trajs: torch.Tensor,
+    pred_conf_logits: torch.Tensor,
+    gt_traj: torch.Tensor,
+    reg_loss_weight: float = 1.0,
+    conf_loss_weight: float = 1.0,
+    cover_loss_weight: float = 0.1,
+    alpha: float = 5.0,
+    conf_temperature: float = 1.5,
+    awta_temperature: float = 8.0,
+    eps: float = 1e-6,
+) -> dict:
+    """
+    Annealed Winner-Takes-All 多模态轨迹损失
+    (基于 ICRA 2025: "Annealed Winner-Takes-All for Motion Forecasting")
+
+    核心改进：所有 K 条轨迹都参与回归，按距离加权；温度随训练退火。
+
+    与 v1/v2 的关键区别:
+    - v1/v2: 只有 winner 收到回归梯度，其余 K-1 条完全无回归信号
+    - v3:    所有 K 条轨迹都按 softmax(-dist/T) 加权参与回归
+             T 随 epoch 退火：初期均匀训练 → 后期逐渐聚焦 winner
+
+    Parameters
+    ----------
+    pred_trajs       : [B, K, num_poses, 3]  预测轨迹（K 条）
+    pred_conf_logits : [B, K]                置信度 logit（未经 softmax）
+    gt_traj          : [B, num_poses, 3]     GT 轨迹
+    reg_loss_weight  : 回归损失权重
+    conf_loss_weight : 置信度损失权重
+    cover_loss_weight: Cover损失权重
+    alpha            : 长度归一化系数
+    conf_temperature : 置信度软标签温度（固定）
+    awta_temperature : 当前退火温度（由外部调度器控制，逐epoch衰减）
+    eps              : 数值稳定
+
+    Returns
+    -------
+    dict:
+        "loss"      : 总损失（scalar）
+        "reg_loss"  : 加权回归损失（scalar）
+        "conf_loss" : 置信度损失（scalar）
+        "cover_loss": Cover损失（scalar）
+        "winner_idx": [B] 每个样本的 winner mode 下标（用于 logging）
+    """
+    B, K, num_poses, _ = pred_trajs.shape
+
+    # ── Step 1: 计算所有轨迹与GT的距离 ───────────────────────────────
+    gt_expanded = gt_traj.unsqueeze(1).expand_as(pred_trajs)        # [B, K, num_poses, 3]
+
+    # 每条轨迹每个pose的L1误差 → per-mode ADE (xy only)
+    dist_xy = torch.norm(
+        pred_trajs[..., :2] - gt_expanded[..., :2],
+        dim=-1,
+    ).mean(dim=-1)                                                   # [B, K]
+
+    winner_idx = dist_xy.argmin(dim=1)                              # [B] for logging
+
+    # ── Step 2: aWTA 加权回归损失（所有mode参与）─────────────────────
+    # 核心：softmax(-dist / T) 让所有mode按距离获得回归权重
+    # T大 → 权重均匀（所有mode平等训练）；T小 → 聚焦winner（接近标准WTA）
+    awta_weights = F.softmax(
+        -dist_xy / awta_temperature, dim=1
+    ).detach()                                                       # [B, K] (stop-gradient on weights)
+
+    # 每条轨迹的per-sample L1损失（含长度归一化）
+    per_mode_l1 = (pred_trajs - gt_expanded).abs().mean(dim=[2, 3])  # [B, K]
+
+    # 长度归一化权重（与v1/v2相同）
+    dxy = gt_traj[:, 1:, :2] - gt_traj[:, :-1, :2]
+    arc_len = torch.linalg.norm(dxy, dim=-1).sum(dim=1)             # [B]
+    w = 1.0 / (alpha + arc_len)
+    w = w * (w.numel() / (w.sum() + eps))                           # [B]
+
+    # 加权回归损失：每个mode按aWTA权重贡献
+    weighted_l1 = (awta_weights * per_mode_l1).sum(dim=1)           # [B]
+    reg_loss = (w * weighted_l1).mean()
+
+    # ── Step 3: 软标签置信度损失（与v2相同）──────────────────────────
+    soft_target = F.softmax(-dist_xy / conf_temperature, dim=1)     # [B, K]
+    log_probs = F.log_softmax(pred_conf_logits, dim=1)              # [B, K]
+    conf_loss = -(soft_target * log_probs).sum(dim=1).mean()
+
+    # ── Step 4: Cover损失（与v2相同）─────────────────────────────────
+    if K > 1:
+        traj_flat = pred_trajs.flatten(2)                           # [B, K, num_poses*3]
+        traj_norm = F.normalize(traj_flat, p=2, dim=-1)
+        sim_matrix = torch.bmm(traj_norm, traj_norm.transpose(1, 2))
+        mask = 1.0 - torch.eye(K, device=pred_trajs.device).unsqueeze(0)
+        off_diag_sim = sim_matrix * mask
+        cover_loss = (off_diag_sim ** 2).sum(dim=[1, 2]) / (K * (K - 1))
+        cover_loss = cover_loss.mean()
+    else:
+        cover_loss = torch.tensor(0.0, device=pred_trajs.device)
+
+    # ── Step 5: 合并总损失 ───────────────────────────────────────────
+    total = (reg_loss_weight * reg_loss +
+             conf_loss_weight * conf_loss +
+             cover_loss_weight * cover_loss)
+
+    return {
+        "loss": total,
+        "reg_loss": reg_loss,
+        "conf_loss": conf_loss,
+        "cover_loss": cover_loss,
+        "winner_idx": winner_idx,
+    }
+
+
+def awta_temperature_schedule(
+    init_temperature: float,
+    epoch: int,
+    exp_base: float,
+ min_temperature: float = 0.1,
+) -> float:
+    """
+    aWTA 退火温度调度器（指数衰减 + 温度下限）
+ 
+    Parameters
+    ----------
+    init_temperature : 初始温度（推荐 8.0~10.0）
+    epoch            : 当前 epoch（从 0 开始）
+    exp_base         : 衰减底数
+                       - 短训练（<50 epochs）: 0.85~0.90
+                       - 长训练（300+ epochs）: 0.98~0.99
+                       公式: base = (target_final_T / init_T) ^ (1 / total_epochs)
+    min_temperature  : 温度下限，防止完全退化为hard WTA（推荐 0.1）
+ 
+    Returns
+    -------
+    float: 当前温度 = max(init_temperature * exp_base^epoch, min_temperature)
+ 
+    温度变化示例（init=8.0, base=0.984, min_T=0.1, 315 epochs）:
+        epoch   0 →  T = 8.00  (近似均匀权重，所有mode平等训练)
+        epoch  50 →  T = 3.59  (轻微分化)
+        epoch 100 →  T = 1.61  (开始明显分化)
+        epoch 150 →  T = 0.72  (聚焦好的mode)
+        epoch 200 →  T = 0.32  (接近WTA但仍保留多样性)
+        epoch 250 →  T = 0.15  (强聚焦winner)
+        epoch 300 →  T = 0.10  (下限保护)
+    """
+    return max(init_temperature * (exp_base ** epoch), min_temperature)
+
 def select_best_trajectory(
     pred_trajs: torch.Tensor,
     conf_logits: torch.Tensor,
@@ -683,15 +844,52 @@ def l1_length_normalized_loss(pred, gt, alpha=5.0, eps=1e-6):
     return (w * per_sample_l1).mean()
 
 
-def prepare_status_feature(states, actions, mode: str = "first"):
+def prepare_status_feature(states, actions, mode: str = "first", use_drive_command: bool = False,
+                           use_states: bool = False, action_dim: int = 7,
+                           straight_thresh: float = 0.3, uturn_thresh: float = 2.5):
     """从 states 和 actions 提取状态特征。
 
     mode:
         - "last": 使用最后一个时
         - "first": 使用起始时刻
         - "history_pool": 对时序做均值池化
+
+    use_drive_command:
+        - 如果为 True，使用 drive_command 替换原始 states 信息
+        - action_dim=7: 前4维 one-hot + 后3维 0填充，输出 [B, 7]
+        - action_dim=4: 纯 one-hot [GO_STRAIGHT, TURN_LEFT, TURN_RIGHT, U_TURN]，输出 [B, 4]
+
+    use_states:
+        - 如果为 True，直接使用原始 states（维度 7），与 predictor 保持一致
+        - 根据 mode 选择对应时间步的 states
     """
     B = states.shape[0]
+
+    if use_drive_command:
+        # 计算 drive_command（基于 delta_yaw 首尾差）
+        yaw = states[:, :, 5]  # [B, T]
+        yaw_start = yaw[:, 0]  # [B]
+        yaw_end = yaw[:, -1]   # [B]
+        delta_yaw = torch.atan2(torch.sin(yaw_end - yaw_start), torch.cos(yaw_end - yaw_start))  # [B]
+
+        abs_delta = torch.abs(delta_yaw)
+        drive_cmd = torch.zeros(B, action_dim, device=states.device, dtype=states.dtype)
+        drive_cmd[:, 0] = (abs_delta < straight_thresh).float()  # GO_STRAIGHT
+        drive_cmd[:, 1] = ((delta_yaw > straight_thresh) & (abs_delta < uturn_thresh)).float()  # TURN_LEFT
+        drive_cmd[:, 2] = ((delta_yaw < -straight_thresh) & (abs_delta < uturn_thresh)).float()  # TURN_RIGHT
+        drive_cmd[:, 3] = (abs_delta >= uturn_thresh).float()  # U_TURN
+
+        return drive_cmd  # [B, action_dim]
+
+    if use_states:
+        # 直接使用原始 states，与 predictor 保持一致
+        if mode == "first":
+            return states[:, 0, :]  # [B, 7]
+        elif mode == "last":
+            return states[:, -1, :]  # [B, 7]
+        else:  # history_pool
+            return states.mean(dim=1)  # [B, 7]
+
     if mode == "first":
         idx = 0
         velocity = states[:, idx, 6:7]
@@ -1059,6 +1257,9 @@ def main(args, resume_preempt=False):
     encoder_ema = cfgs_train.get("encoder_ema",False)
     perceiver_ema = cfgs_train.get("perceiver_ema",True)
     predictor_train = cfgs_train.get("predictor_train",True)
+    use_states_for_predictor = cfgs_train.get("use_states_for_predictor", True)  # 是否将states作为predictor输入
+    use_drive_command_for_predictor = cfgs_train.get("use_drive_command_for_predictor", False)  # 使用drive_command替代states
+    action_dim = cfgs_train.get("action_dim", 7)  # action 维度: 7 (机器人) 或 4 (自动驾驶)
     # -- EMA
     cfgs_ema = args.get("ema")
     use_ema = cfgs_ema.get("use_ema", True)
@@ -1098,11 +1299,16 @@ def main(args, resume_preempt=False):
     conf_loss_weight = cfgs_planner.get("conf_loss_weight", 1.0)
     reg_loss_weight = cfgs_planner.get("reg_loss_weight", 1.0)
     status_mode = cfgs_planner.get("status_mode", "first")  # 状态特征模式: last, first, history_pool
+    use_status = cfgs_planner.get("use_status", True)  # 是否使用 status 特征
     use_z_context = cfgs_planner.get("use_z_context", False)  # True: 用 z_context(encoder输出) 作为planner输入; False: 用 z_ar
-    # WTA损失版本选择 (v1: 原版硬标签, v2: 改进版软标签+Cover损失)
+    # WTA损失版本选择 (v1: 原版硬标签, v2: 改进版软标签+Cover损失, v3: Annealed WTA)
     wta_loss_version = cfgs_planner.get("wta_loss_version", "v1")
-    wta_temperature = cfgs_planner.get("wta_temperature", 1.0)  # v2专用: 软标签温度
-    cover_loss_weight = cfgs_planner.get("cover_loss_weight", 0.1)  # v2专用: Cover损失权重
+    wta_temperature = cfgs_planner.get("wta_temperature", 1.0)  # v2/v3: 置信度软标签温度
+    cover_loss_weight = cfgs_planner.get("cover_loss_weight", 0.1)  # v2/v3: Cover损失权重
+    # v3 (aWTA) 专用参数
+    awta_init_temperature = cfgs_planner.get("awta_init_temperature", 8.0)  # v3: 退火初始温度
+    awta_exp_base = cfgs_planner.get("awta_exp_base", 0.984)  # v3: 退火衰减底数
+    awta_min_temperature = cfgs_planner.get("awta_min_temperature", 0.1)
     # -- DATA
     cfgs_data = args.get("data")
     datasets = cfgs_data.get("datasets", [])
@@ -1184,25 +1390,49 @@ def main(args, resume_preempt=False):
         torch.cuda.set_device(device)
 
     # -- log/checkpointing paths
-    log_file = os.path.join(folder, f"log_r{rank}.csv")
+    log_file = os.path.join(folder, f"log_r{rank}.txt")
     latest_path = os.path.join(folder, "latest.pt")
+    best_path = os.path.join(folder, "best_ade.pt")  # 基于ADE保存最佳checkpoint
     resume_path = os.path.join(folder, r_file) if r_file is not None else latest_path
     if not os.path.exists(resume_path):
         resume_path = None
 
-    # -- make csv_logger
-    csv_logger = CSVLogger(
+    # -- 最佳指标追踪 (用于保存最佳checkpoint)
+    best_ade = float('inf')
+    best_fde = float('inf')
+    best_minade_k = float('inf')
+    best_minfde_k = float('inf')
+    best_epoch = 0
+
+    # -- make table_logger (改进版：每个epoch记录一次平均指标，带边框表格格式)
+    csv_logger = TableLogger(
         log_file,
+        ("%s", "type"),         # train 或 val
         ("%d", "epoch"),
-        ("%d", "itr"),
         ("%.5f", "loss"),
         ("%.5f", "seg_loss"),
-        ("%.5f", "mask_loss"),  # 新增
-        ("%.5f", "dice_loss"),  # 新增
-        ("%d", "iter-time(ms)"),
-        ("%d", "gpu-time(ms)"),
-        ("%d", "dataload-time(ms)"),
+        ("%.5f", "mask_loss"),
+        ("%.5f", "dice_loss"),
+        ("%.5f", "traj_loss"),
+        ("%.5f", "reg_loss"),
+        ("%.5f", "conf_loss"),
+        ("%.1f", "avg_iter_time(ms)"),
+        ("%.1f", "avg_gpu_time(ms)"),
+        ("%.1f", "avg_dataload_time(ms)"),
+        # 验证指标 (训练行时为空)
+        ("%.5f", "val_ade"),
+        ("%.5f", "val_fde"),
+        ("%.5f", "val_minade_k"),
+        ("%.5f", "val_minfde_k"),
         mode="+a",
+        comments=[
+            "Training Log - Each epoch records average metrics",
+            "Columns: [type, epoch] | [loss, seg_loss*, traj_loss*] | [time metrics] | [val metrics]",
+            "  - type: 'train' = epoch avg losses, 'val' = validation metrics",
+            "  - seg_loss*: mask_loss + dice_loss",
+            "  - traj_loss*: wta_loss + reg_loss + conf_loss",
+            "  - val metrics: ADE, FDE, minADE@K, minFDE@K (only in val rows)",
+        ],
     )
     
     if rank == 0:
@@ -1256,7 +1486,7 @@ def main(args, resume_preempt=False):
         pred_num_heads=pred_num_heads,
         pred_embed_dim=pred_embed_dim,
         embed_dim=encoder_embed_dim,
-        action_embed_dim=7,
+        action_embed_dim=action_dim,  # 使用配置中的 action_dim
         pred_is_frame_causal=pred_is_frame_causal,
         use_extrinsics=use_extrinsics,
         use_sdpa=use_sdpa,
@@ -1268,7 +1498,7 @@ def main(args, resume_preempt=False):
         use_perceiver_ema=perceiver_ema,
         target_shape=None
     )
-    logger.info("end init predictor")
+    logger.info(f"end init predictor (action_embed_dim={action_dim})")
 
     # 打印参数量
     encoder_params = sum(p.numel() for p in encoder.parameters())
@@ -1324,6 +1554,14 @@ def main(args, resume_preempt=False):
     encoder_dim = encoder.backbone.embed_dim
 
     if use_planner:
+        # 根据 use_drive_command_for_predictor 和 use_states_for_predictor 决定 status_dim
+        if use_drive_command_for_predictor:
+            planner_status_dim = action_dim  # 4 或 7
+        elif use_states_for_predictor:
+            planner_status_dim = 7  # 原始 states 维度（默认值）
+        else:
+            planner_status_dim = 8  # 提取的特征维度
+
         planner = MultiModalTemporalPlanner(
             encoder_dim=encoder_dim,
             tf_d_model=tf_d_model,
@@ -1334,21 +1572,27 @@ def main(args, resume_preempt=False):
             tokens_per_frame=tokens_per_frame,
             num_poses=num_poses,
             num_time_steps=num_time_steps,
-            status_dim=8,
+            status_dim=planner_status_dim,
             use_spatial_tokens=use_spatial_tokens,
             num_modes=num_modes,
             use_temporal=use_temporal,
-            temporal_alignment=temporal_alignment,
-            causal_mask=causal_mask,
+            use_time_aligned_bias=temporal_alignment,
             use_z_context=use_z_context,
+            use_status=use_status,
         ).to(device)
 
         planner_params = sum(p.numel() for p in planner.parameters())
         input_src = "z_context (encoder output)" if use_z_context else "z_ar (predictor output)"
-        if use_temporal:
-            logger.info(f"planner_params: {planner_params / 1e6:.2f}M (TemporalPlanner, input={input_src}, num_time_steps={num_time_steps}, use_spatial_tokens={use_spatial_tokens}, temporal_alignment={temporal_alignment}, causal_mask={causal_mask})")
+        if use_drive_command_for_predictor:
+            status_info = f"status_dim={planner_status_dim} (drive_command)"
+        elif use_states_for_predictor:
+            status_info = f"status_dim={planner_status_dim} (raw_states)"
         else:
-            logger.info(f"planner_params: {planner_params / 1e6:.2f}M (SingleFramePlanner, input={input_src}, use_spatial_tokens={use_spatial_tokens})")
+            status_info = f"status_dim={planner_status_dim} (extracted)"
+        if use_temporal:
+            logger.info(f"planner_params: {planner_params / 1e6:.2f}M (TemporalPlanner, input={input_src}, num_time_steps={num_time_steps}, use_spatial_tokens={use_spatial_tokens}, temporal_alignment={temporal_alignment}, causal_mask={causal_mask}, {status_info})")
+        else:
+            logger.info(f"planner_params: {planner_params / 1e6:.2f}M (SingleFramePlanner, input={input_src}, use_spatial_tokens={use_spatial_tokens}, {status_info})")
     else:
         planner = None
         logger.info("use_planner=False, planner is disabled")
@@ -1395,7 +1639,8 @@ def main(args, resume_preempt=False):
         rank=rank,
         load_segmentation=use_segmentation,  # 新增
         seg_data_root=seg_data_root,  # 新增
-        crop_size= crop_size
+        crop_size= crop_size,
+        action_dim=action_dim,  # action 维度
     )
     
     _dlen = len(unsupervised_loader)
@@ -1426,7 +1671,8 @@ def main(args, resume_preempt=False):
             rank=rank,
             load_segmentation=False,  # 验证时不需要分割标注
             seg_data_root=None,
-            crop_size=crop_size
+            crop_size=crop_size,
+            action_dim=action_dim,  # action 维度
         )
         logger.info(f"Validation dataset initialized with {len(val_loader)} batches")
     else:
@@ -1479,7 +1725,8 @@ def main(args, resume_preempt=False):
         seg_neck = DistributedDataParallel(seg_neck, find_unused_parameters=False)
 
     if use_planner:
-        planner = DistributedDataParallel(planner, find_unused_parameters=False)
+        # 当 use_status=False 时，status_encoding 层不参与前向传播，需要启用 find_unused_parameters
+        planner = DistributedDataParallel(planner, find_unused_parameters=(not use_status))
 
     # 冻结参数
     for p in encoder.parameters():
@@ -1544,7 +1791,14 @@ def main(args, resume_preempt=False):
     logger.info(f"{'='*50}")
     logger.info(f"Trainable Parameters Summary:")
     logger.info(f"  encoder:           {sum(p.numel() for p in encoder.parameters() if p.requires_grad) / 1e6:>8.2f}M")
-    logger.info(f"  predictor:         {sum(p.numel() for p in predictor.parameters() if p.requires_grad) / 1e6:>8.2f}M")
+    # 显示predictor的states输入模式
+    if use_drive_command_for_predictor:
+        predictor_state_mode = "drive_command"
+    elif use_states_for_predictor:
+        predictor_state_mode = "states"
+    else:
+        predictor_state_mode = "none(zeros)"
+    logger.info(f"  predictor:         {sum(p.numel() for p in predictor.parameters() if p.requires_grad) / 1e6:>8.2f}M (state_mode={predictor_state_mode})")
     if seg_neck is not None:
         logger.info(f"  seg_neck:          {sum(p.numel() for p in seg_neck.parameters() if p.requires_grad) / 1e6:>8.2f}M")
     if seg_head is not None:
@@ -1586,15 +1840,15 @@ def main(args, resume_preempt=False):
         if load_predictor and 'predictor' in checkpoint:
             load_state_dict(predictor, checkpoint['predictor'], 'predictor')
 
-        # if load_seg:
-        #     if seg_neck is not None and 'seg_neck' in checkpoint:
-        #         load_state_dict(seg_neck, checkpoint['seg_neck'], 'seg_neck')
-        #     if seg_head is not None and 'seg_head' in checkpoint:
-        #         load_state_dict(seg_head, checkpoint['seg_head'], 'seg_head')
+        if load_seg:
+            if seg_neck is not None and 'seg_neck' in checkpoint:
+                load_state_dict(seg_neck, checkpoint['seg_neck'], 'seg_neck')
+            if seg_head is not None and 'seg_head' in checkpoint:
+                load_state_dict(seg_head, checkpoint['seg_head'], 'seg_head')
 
-        # # ==================== 新增：加载 Planner 权重 ====================
-        # if load_planner and 'planner' in checkpoint:
-        #     load_state_dict(planner, checkpoint['planner'], 'planner')
+        # ==================== 新增：加载 Planner 权重 ====================
+        if load_planner and 'planner' in checkpoint:
+            load_state_dict(planner, checkpoint['planner'], 'planner')
 
         logger.info("Full pretrained checkpoint loaded successfully!")
     elif p_file_full is not None:
@@ -1839,10 +2093,58 @@ def main(args, resume_preempt=False):
 
                     return z
 
+                def compute_drive_command(states, straight_thresh=0.3, uturn_thresh=2.5):
+                    """
+                    从states计算drive_command（基于delta_yaw首尾差）
+                    与stat_delta_yaw.py逻辑一致：整段clip基于首尾yaw差共享同一个命令
+
+                    states: [B, T, 7] - [x, y, z, roll, pitch, yaw, velocity]
+
+                    返回:
+                        - action_dim=7: [B, T, 7] - 前4维 one-hot + 后3维 0填充
+                        - action_dim=4: [B, T, 4] - 纯 one-hot [GO_STRAIGHT, TURN_LEFT, TURN_RIGHT, U_TURN]
+                    """
+                    B, T, _ = states.shape
+                    # 提取yaw (第5列)
+                    yaw = states[:, :, 5]  # [B, T]
+
+                    # 计算首尾yaw差（与stat_delta_yaw.py一致）
+                    yaw_start = yaw[:, 0]  # [B]
+                    yaw_end = yaw[:, -1]   # [B]
+                    delta_yaw = torch.atan2(torch.sin(yaw_end - yaw_start), torch.cos(yaw_end - yaw_start))  # [B]
+
+                    # 分类（整段clip共享同一个命令）
+                    abs_delta = torch.abs(delta_yaw)
+                    # GO_STRAIGHT: |delta| < straight_thresh
+                    # TURN_LEFT: delta > straight_thresh and |delta| < uturn_thresh
+                    # TURN_RIGHT: delta < -straight_thresh and |delta| < uturn_thresh
+                    # U_TURN: |delta| >= uturn_thresh
+
+                    # 根据 action_dim 选择输出维度
+                    output_dim = action_dim
+                    cmd_single = torch.zeros(B, output_dim, device=states.device, dtype=states.dtype)
+                    cmd_single[:, 0] = (abs_delta < straight_thresh).float()  # GO_STRAIGHT
+                    cmd_single[:, 1] = ((delta_yaw > straight_thresh) & (abs_delta < uturn_thresh)).float()  # TURN_LEFT
+                    cmd_single[:, 2] = ((delta_yaw < -straight_thresh) & (abs_delta < uturn_thresh)).float()  # TURN_RIGHT
+                    cmd_single[:, 3] = (abs_delta >= uturn_thresh).float()  # U_TURN
+
+                    # 扩展到所有时间步 [B, T, output_dim]
+                    cmd = cmd_single.unsqueeze(1).expand(B, T, output_dim)
+
+                    return cmd
+
                 def forward_predictions(z, actions, states, extrinsics):
-                    """Predictor保持不变"""
+                    """Predictor前向传播，支持控制是否使用states或drive_command"""
                     def _step_predictor(_z, _a, _s, _e):
-                        _z = predictor(_z, _a, _s, _e)
+                        # 根据配置决定输入类型
+                        if use_drive_command_for_predictor:
+                            # 使用drive_command替代states
+                            _states_input = compute_drive_command(_s)
+                        elif use_states_for_predictor:
+                            _states_input = _s
+                        else:
+                            _states_input = torch.zeros_like(_s)
+                        _z = predictor(_z, _a, _states_input, _e)
                         if normalize_reps:
                             _z = F.layer_norm(_z, (_z.size(-1),))
                         return _z
@@ -1853,7 +2155,7 @@ def main(args, resume_preempt=False):
                     # Autoregressive rollout
                     _z = torch.cat([z[:, :tokens_per_frame], z_tf[:, :tokens_per_frame]], dim=1)
                     num_prediction_steps = z.size()[1] // tokens_per_frame - 1
-                    
+
                     for k in range(1, num_prediction_steps):
                         if k == num_prediction_steps - 1:
                             _a, _s, _e = actions, states[:, :-1], extrinsics[:, :-1]
@@ -1861,7 +2163,7 @@ def main(args, resume_preempt=False):
                             _a, _s, _e = actions[:, :k+1], states[:, :k+1], extrinsics[:, :k+1]
                         _z_nxt = _step_predictor(_z, _a, _s, _e)[:, -tokens_per_frame:]
                         _z = torch.cat([_z, _z_nxt], dim=1)
-                    
+
                     z_ar = _z[:, tokens_per_frame:]
                     return z_tf, z_ar
 
@@ -1895,10 +2197,14 @@ def main(args, resume_preempt=False):
                     if use_planner and planner is not None:
                         B = z_ar.shape[0]
 
-                        # 准备状态特征
-                        status_feature = prepare_status_feature(states, actions, mode=status_mode)
+                        # 准备状态特征（支持 drive_command 替换，与 predictor 保持一致）
+                        status_feature = prepare_status_feature(
+                            states, actions, mode=status_mode,
+                            use_drive_command=use_drive_command_for_predictor,
+                            use_states=use_states_for_predictor,
+                            action_dim=action_dim
+                        )
 
-                        # Planner forward
                         # ── Planner forward (多模态) ───────────────────────
                         planner_out = planner(z_ar, status_feature, z_context=z_context)
                         pred_trajs   = planner_out["trajectories"]   # [B, K, num_poses, 3]
@@ -1947,6 +2253,25 @@ def main(args, resume_preempt=False):
                                 alpha=5.0,
                                 temperature=wta_temperature,
                             )
+                        elif wta_loss_version == "v3":
+                            # 多模型 v3: Annealed WTA (所有mode参与回归 + 温度退火)
+                            cur_awta_temp = awta_temperature_schedule(
+                                init_temperature=awta_init_temperature,
+                                epoch=epoch,
+                                exp_base=awta_exp_base,
+                                min_temperature=awta_min_temperature
+                            )
+                            wta_result = wta_loss_v3(
+                                pred_trajs=pred_trajs,
+                                pred_conf_logits=pred_conf,
+                                gt_traj=gt_trajectory,
+                                reg_loss_weight=reg_loss_weight,
+                                conf_loss_weight=conf_loss_weight,
+                                cover_loss_weight=cover_loss_weight,
+                                alpha=5.0,
+                                conf_temperature=wta_temperature,
+                                awta_temperature=cur_awta_temp,
+                            )
                         else:  # v1 (默认)
                             # 多模型 v1
                             wta_result = wta_loss(
@@ -1964,18 +2289,18 @@ def main(args, resume_preempt=False):
                         _winner    = wta_result["winner_idx"]          # [B] for logging
 
                         # ── 调试日志（前几步） ────────────────────────────
-                        if itr < 20:
-                            if num_modes == 1:
-                                logger.info(
-                                    f"SingleModel: reg={_reg_loss.item():.4f}"
-                                )
-                            else:
-                                logger.info(
-                                    f"WTA(v{wta_loss_version}): winner_modes={_winner.tolist()}, "
-                                    f"reg={_reg_loss.item():.4f}, "
-                                    f"conf={_conf_loss.item():.4f}, "
-                                    f"cover={_cover_loss.item():.4f}"
-                                )
+                        # if itr < 20:
+                        #     if num_modes == 1:
+                        #         logger.info(
+                        #             f"SingleModel: reg={_reg_loss.item():.4f}"
+                        #         )
+                        #     else:
+                        #         logger.info(
+                        #             f"WTA(v{wta_loss_version}): winner_modes={_winner.tolist()}, "
+                        #             f"reg={_reg_loss.item():.4f}, "
+                        #             f"conf={_conf_loss.item():.4f}, "
+                        #             f"cover={_cover_loss.item():.4f}"
+                        #         )
 
                         # ── 轨迹可视化（用置信度最高的那条） ─────────────
                         if should_visualize:
@@ -2133,19 +2458,7 @@ def main(args, resume_preempt=False):
 
             # ==================== Logging ====================
             def log_stats():
-                csv_logger.log(
-                    epoch + 1, 
-                    itr, 
-                    loss, 
-                    seg_loss_value,  # 新增
-                    mask_loss_value,
-                    dice_loss_value,
-                    iter_elapsed_time_ms, 
-                    gpu_etime_ms, 
-                    data_elapsed_time_ms
-                )
-                
-                # TensorBoard logging
+                # TensorBoard logging (保留迭代级别的记录)
                 if rank == 0 and tb_writer is not None:
                     global_step = epoch * ipe + itr
                     
@@ -2171,9 +2484,12 @@ def main(args, resume_preempt=False):
                                         torch.cuda.max_memory_allocated() / 1024.0**2,
                                         global_step)
 
-                    # Planner详细损失 (v2专用)
-                    if wta_loss_version == "v2":
+                    # Planner详细损失 (v2/v3专用)
+                    if wta_loss_version in ("v2", "v3"):
                         tb_writer.add_scalar('Planner/cover_loss', cover_loss_meter.avg, global_step)
+                    if wta_loss_version == "v3":
+                        cur_awta_temp_log = awta_temperature_schedule(awta_init_temperature, epoch, awta_exp_base,awta_min_temperature)
+                        tb_writer.add_scalar('Planner/awta_temperature', cur_awta_temp_log, global_step)
 
                 if (itr % log_freq == 0) or (itr == ipe - 1) or np.isnan(loss) or np.isinf(loss):
                     # 根据 num_modes 和 WTA版本显示不同的日志格式
@@ -2219,6 +2535,29 @@ def main(args, resume_preempt=False):
                                 data_elapsed_time_meter.avg,
                             )
                         )
+                    elif wta_loss_version == "v3":
+                        # 多模型 v3 (aWTA) 日志
+                        cur_awta_temp_log = awta_temperature_schedule(awta_init_temperature, epoch, awta_exp_base)
+                        logger.info(
+                            "主人，[%d, %5d] loss: %.3f "
+                            "[jepa: %.2f+%.2f, seg: %.3f (mask: %.3f, dice: %.3f)] "
+                            "[traj=[aWTA:%.3f reg:%.3f conf:%.3f cover:%.3f T:%.2f]] "
+                            "[wd: %.2e] [lr: %.2e] "
+                            "[mem: %.2e] "
+                            "[iter: %.1f ms] [gpu: %.1f ms] [data: %.1f ms]"
+                            % (
+                                epoch + 1, itr,
+                                loss_meter.avg,
+                                jloss_meter.avg, sloss_meter.avg,
+                                seg_loss_meter.avg, mask_loss_meter.avg, dice_loss_meter.avg,
+                                traj_loss_meter.avg, reg_loss_meter.avg, conf_loss_meter.avg, cover_loss_meter.avg,
+                                cur_awta_temp_log,
+                                _new_wd, _new_lr,
+                                torch.cuda.max_memory_allocated() / 1024.0**2,
+                                iter_time_meter.avg, gpu_time_meter.avg,
+                                data_elapsed_time_meter.avg,
+                            )
+                        )
                     else:  # v1
                         # 多模型 v1 日志
                         logger.info(
@@ -2245,15 +2584,42 @@ def main(args, resume_preempt=False):
             assert not np.isnan(loss), "主人，损失为nan"
 
         # ==================== Epoch结束 ====================
-        logger.info(f"主人，Epoch {epoch + 1} 平均损失: %.3f (JEPA: %.3f, Seg: %.3f)" % 
+        logger.info(f"主人，Epoch {epoch + 1} 平均损失: %.3f (JEPA: %.3f, Seg: %.3f)" %
                    (loss_meter.avg, jloss_meter.avg + sloss_meter.avg, seg_loss_meter.avg))
-        
+
         if rank == 0 and tb_writer is not None:
             tb_writer.add_scalar('Epoch/avg_loss', loss_meter.avg, epoch + 1)
             tb_writer.add_scalar('Epoch/avg_jloss', jloss_meter.avg, epoch + 1)
             tb_writer.add_scalar('Epoch/avg_sloss', sloss_meter.avg, epoch + 1)
             tb_writer.add_scalar('Epoch/avg_seg_loss', seg_loss_meter.avg, epoch + 1)  # 新增
             tb_writer.flush()
+
+        # 判断本epoch是否有验证
+        has_validation = use_planner and val_loader is not None and (epoch + 1) % val_freq == 0
+
+        # 记录epoch平均指标到 CSV (只由 rank 0 记录)
+        # 如果没有验证，则在训练行后添加空行分隔
+        if rank == 0:
+            csv_logger.log(
+                "train",           # type
+                epoch + 1,
+                loss_meter.avg,
+                seg_loss_meter.avg,
+                mask_loss_meter.avg,
+                dice_loss_meter.avg,
+                traj_loss_meter.avg,
+                reg_loss_meter.avg,
+                conf_loss_meter.avg,
+                iter_time_meter.avg,
+                gpu_time_meter.avg,
+                data_elapsed_time_meter.avg,
+                # 验证指标 (训练时为空)
+                float('nan'),
+                float('nan'),
+                float('nan'),
+                float('nan'),
+                add_separator=not has_validation,  # 无验证时添加空行
+            )
 
         # ==================== 保存Checkpoint ====================
         if epoch % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
@@ -2295,12 +2661,68 @@ def main(args, resume_preempt=False):
                 if 'minade_k' in val_metrics and 'minfde_k' in val_metrics:
                     msg += f", minADE@K={val_metrics['minade_k']:.4f}, minFDE@K={val_metrics['minfde_k']:.4f}"
                 logger.info(msg)
+
+            # 记录验证指标到 CSV (只由 rank 0 记录)
+            if rank == 0:
+                csv_logger.log(
+                    "val",              # type
+                    epoch + 1,
+                    float('nan'),       # loss
+                    float('nan'),       # seg_loss
+                    float('nan'),       # mask_loss
+                    float('nan'),       # dice_loss
+                    float('nan'),       # traj_loss
+                    float('nan'),       # reg_loss
+                    float('nan'),       # conf_loss
+                    float('nan'),       # avg_iter_time
+                    float('nan'),       # avg_gpu_time
+                    float('nan'),       # avg_dataload_time
+                    # 验证指标
+                    val_metrics.get('ade', float('nan')),
+                    val_metrics.get('fde', float('nan')),
+                    val_metrics.get('minade_k', float('nan')),
+                    val_metrics.get('minfde_k', float('nan')),
+                    add_separator=True,  # 验证行后添加空行分隔
+                )
+
+            # ==================== 保存最佳Checkpoint ====================
+            # 基于ADE指标判断是否为最佳模型
+            current_ade = val_metrics.get('ade', float('inf'))
+            if current_ade < best_ade:
+                best_ade = current_ade
+                best_fde = val_metrics.get('fde', float('inf'))
+                best_minade_k = val_metrics.get('minade_k', float('inf'))
+                best_minfde_k = val_metrics.get('minfde_k', float('inf'))
+                best_epoch = epoch + 1
+
+                # 保存最佳checkpoint
+                save_checkpoint(epoch + 1, best_path)
+                logger.info(
+                    f"*** 新最佳模型! Epoch {epoch + 1} *** "
+                    f"ADE: {best_ade:.5f} | FDE: {best_fde:.5f} | "
+                    f"minADE@K: {best_minade_k:.5f} | minFDE@K: {best_minfde_k:.5f}"
+                )
+            else:
+                logger.info(
+                    f"当前 ADE: {current_ade:.5f}, 最佳 ADE: {best_ade:.5f} (Epoch {best_epoch})"
+                )
     
     # ==================== 训练结束 ====================
+    if rank == 0:
+        logger.info("=" * 60)
+        logger.info("*** 训练完成! 最佳模型统计 ***")
+        logger.info(f"最佳 Epoch: {best_epoch}")
+        logger.info(f"最佳 ADE: {best_ade:.5f}")
+        logger.info(f"最佳 FDE: {best_fde:.5f}")
+        logger.info(f"最佳 minADE@K: {best_minade_k:.5f}")
+        logger.info(f"最佳 minFDE@K: {best_minfde_k:.5f}")
+        logger.info(f"最佳checkpoint保存于: {best_path}")
+        logger.info("=" * 60)
+
     if rank == 0 and tb_writer is not None:
         tb_writer.close()
         logger.info("主人，TensorBoard writer已关闭。")
-    
+
     logger.info("主人，训练完成！")
 
 
