@@ -796,20 +796,13 @@ def prepare_status_feature(
     actions: torch.Tensor,
     status_mode: str = "current_only",
     num_context_frames: int = 1,
-    frameskip: int = 1,
     straight_thresh: float = 0.3,
     uturn_thresh: float = 2.5,
 ) -> torch.Tensor:
     """从 states 提取 planner 状态特征，统一输出 [B, status_dim]。
 
-    注意：states 在 cowa.py 数据加载时已经执行了 [::frameskip] 下采样，
-    因此相邻两帧之间实际间隔 frameskip 个原始时间步。计算加速度、yaw_rate
-    等时间导数时，需要除以 frameskip 以得到正确的物理量。
-
     states: [B, T, 7]  —  每帧 [x, y, z, roll, pitch, yaw, velocity]
-                          （T 为 frameskip 下采样后的帧数）
     actions: [B, T-1, action_dim]  （本函数未使用，保留接口兼容）
-    frameskip: 数据加载时的帧间隔（tubelet_size），用于归一化时间导数
 
     status_mode:
         - "ego_history_sequence": 多帧 [velocity, acceleration, yaw_rate]，对齐 num_context_frames
@@ -822,7 +815,6 @@ def prepare_status_feature(
     T = states.shape[1]
     ncf = min(num_context_frames, T)
     cur_idx = ncf - 1  # "当前帧" = context 窗口的最后一帧
-    dt = float(frameskip)  # 相邻帧之间的实际时间步数
 
     if status_mode == "ego_history_sequence":
         # 每帧: [velocity, acceleration, yaw_rate]
@@ -830,11 +822,11 @@ def prepare_status_feature(
         for t in range(ncf):
             vel = states[:, t, 6:7]  # [B, 1]
             if t > 0:
-                acc = (states[:, t, 6:7] - states[:, t - 1, 6:7]) / dt
+                acc = states[:, t, 6:7] - states[:, t - 1, 6:7]
                 dyaw = torch.atan2(
                     torch.sin(states[:, t, 5:6] - states[:, t - 1, 5:6]),
                     torch.cos(states[:, t, 5:6] - states[:, t - 1, 5:6]),
-                ) / dt
+                )
             else:
                 acc = torch.zeros_like(vel)
                 dyaw = torch.zeros_like(vel)
@@ -843,7 +835,7 @@ def prepare_status_feature(
 
     elif status_mode == "current_only":
         vel = states[:, cur_idx, 6:7]
-        acc = ((states[:, cur_idx, 6:7] - states[:, cur_idx - 1, 6:7]) / dt) if cur_idx > 0 else torch.zeros_like(vel)
+        acc = (states[:, cur_idx, 6:7] - states[:, cur_idx - 1, 6:7]) if cur_idx > 0 else torch.zeros_like(vel)
         yaw = states[:, cur_idx, 5:6]
         xy = states[:, cur_idx, 0:2]
         return torch.cat([vel, acc, yaw, xy], dim=-1)  # [B, 5]
@@ -851,19 +843,15 @@ def prepare_status_feature(
     elif status_mode == "current_plus_command":
         # current_only 部分
         vel = states[:, cur_idx, 6:7]
-        acc = ((states[:, cur_idx, 6:7] - states[:, cur_idx - 1, 6:7]) / dt) if cur_idx > 0 else torch.zeros_like(vel)
+        acc = (states[:, cur_idx, 6:7] - states[:, cur_idx - 1, 6:7]) if cur_idx > 0 else torch.zeros_like(vel)
         yaw = states[:, cur_idx, 5:6]
         xy = states[:, cur_idx, 0:2]
         ego_feat = torch.cat([vel, acc, yaw, xy], dim=-1)  # [B, 5]
 
         # 基于历史帧 yaw 趋势估计 drive_command（不依赖未来帧）
-        # delta_yaw 跨越 (ncf-1)*frameskip 个原始时间步，归一化为每步 yaw_rate 后再判阈值
         yaw_start = states[:, 0, 5]
         yaw_cur = states[:, cur_idx, 5]
-        delta_yaw_total = torch.atan2(torch.sin(yaw_cur - yaw_start), torch.cos(yaw_cur - yaw_start))
-        # 归一化：将总 yaw 变化量除以实际跨越的原始帧数，使阈值不随 frameskip 变化
-        actual_span = max(1.0, float(cur_idx) * dt)
-        delta_yaw = delta_yaw_total / actual_span * float(max(1, ncf - 1))  # 归一化到 ncf-1 帧的尺度
+        delta_yaw = torch.atan2(torch.sin(yaw_cur - yaw_start), torch.cos(yaw_cur - yaw_start))
         abs_delta = torch.abs(delta_yaw)
 
         cmd = torch.zeros(B, 4, device=states.device, dtype=states.dtype)
@@ -897,7 +885,7 @@ def prepare_status_feature(
         traj_flat = torch.cat(traj_feats, dim=-1)  # [B, ncf * 3]
 
         vel = states[:, cur_idx, 6:7]
-        acc = ((states[:, cur_idx, 6:7] - states[:, cur_idx - 1, 6:7]) / dt) if cur_idx > 0 else torch.zeros_like(vel)
+        acc = (states[:, cur_idx, 6:7] - states[:, cur_idx - 1, 6:7]) if cur_idx > 0 else torch.zeros_like(vel)
         return torch.cat([traj_flat, vel, acc], dim=-1)  # [B, ncf * 3 + 2]
 
     elif status_mode == "raw_states":
@@ -1937,7 +1925,7 @@ def main(args, resume_preempt=False):
             def load_clips():
                 context_frames = sample[0].to(device, non_blocking=True)  # [B, C, 2, H, W]
                 actions = sample[1].to(device, dtype=torch.float, non_blocking=True)  # [B, 15, 7]
-                states = sample[2].to(device, dtype=torch.float, non_blocking=True)   # [B, T//frameskip, 7] (已在数据加载时执行 [::frameskip] 下采样)
+                states = sample[2].to(device, dtype=torch.float, non_blocking=True)   # [B, 16, 7]
                 extrinsics = sample[3].to(device, dtype=torch.float, non_blocking=True)  # [B, 16, 7]
 
                 # ==================== 新增：加载分割标注 ====================
@@ -2154,7 +2142,6 @@ def main(args, resume_preempt=False):
                             states, actions,
                             status_mode=status_mode,
                             num_context_frames=num_context_frames,
-                            frameskip=tubelet_size,
                         )
 
                         # ── Planner forward (多模态) ───────────────────────
