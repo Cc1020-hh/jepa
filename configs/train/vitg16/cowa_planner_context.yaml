@@ -1,6 +1,6 @@
 app: vjepa_cowa_planner
 cpus_per_task: 12
-folder: /disk/deepdata/hch_workspace/code/vjepa2/results/cowa/vitg16-256px-8f_hf_planner_mm_fintune_predictor_encoder
+folder: /disk/deepdata/hch_workspace/code/vjepa2/results/cowa/vitg16-256px-8f_hf_planner_mm_context_ego_history_sequence
 mem_per_gpu: 81G
 nodes: 1
 tasks_per_node: 8
@@ -48,11 +48,11 @@ meta:
   resume_checkpoint: null
   load_predictor: true
   load_encoder: true  # 是否加载 encoder 权重
-  load_seg: true  # 是否加载 seg 权重
-  load_planner: true  # 是否加载 planner 权重
+  load_seg: false  # 是否加载 seg 权重
+  load_planner: false  # 是否加载 planner 权重
   pretrain_checkpoint: /disk/deepdata/hch_workspace/pretrained/vjepa/vjepa2-vitg-fpc64-256/model.safetensors
   # 包含 encoder, predictor, seg 的预训练 checkpoint
-  pretrain_checkpoint_full: /disk/deepdata/hch_workspace/code/vjepa2/results/cowa/vitg16-256px-8f_hf_planner_mm_train_predictor/latest.pt
+  pretrain_checkpoint_full: /disk/deepdata/hch_workspace/code/vjepa2/results/cowa/vitg16-256px-8f_hf_planner_mm_fintune_predictor_encoder/latest.pt
   pretrain_repo: /disk/deepdata/hch_workspace/pretrained/vjepa/vjepa2-vitg-fpc64-256/
   context_encoder_key: target_encoder
   target_encoder_key: target_encoder
@@ -74,11 +74,11 @@ optimization:
   epochs: 315
   final_lr: 0.0
   final_weight_decay: 0.04
-  enc_lr_scale: 1
+  enc_lr_scale: 0.01
   ipe: 300
-  lr: 0.000425
+  lr: 0.00001
   start_lr: 0.000075
-  warmup: 15
+  warmup: 30
   weight_decay: 0.04
 ema:
   use_ema: true
@@ -103,21 +103,27 @@ train:
   seg_head: false  # 冻结 seg 部分
   encoder_ema: false
   perceiver_ema: false
-  predictor_train: true
+  predictor_train: false
+  action_dim: 7
+  use_states_for_predictor: false  # 不使用states作为predictor输入
+  use_drive_command_for_predictor: false
 planner:
-  use_planner: false
+  use_planner: true
   tf_d_model: 256
   tf_d_ffn: 1024
   tf_num_layers: 3
   tf_num_head: 8
   tf_dropout: 0.0
-  planner_loss_weight: 0.5
+  planner_loss_weight: 1
   use_spatial_tokens: True
   num_modes: 6
-  num_context_frames: 1  # 历史帧+当前帧总数 (1=单帧, >1=时序模式，用于 train_context.py)
-  status_mode: "current_only"  # ego_history_sequence / current_only / current_plus_command / history_trajectory / raw_states
+  num_context_frames: 2  # 历史帧+当前帧总数 (1=单帧, >1=时序模式，用于 train_context.py)
+  status_mode: "ego_history_sequence"  # ego_history_sequence / current_only / current_plus_command / history_trajectory / raw_states
   conf_loss_weight: 0.5
   reg_loss_weight: 1.0
-  wta_loss_version: v1  # 可选: v1 或 v2
-  wta_temperature: 1.0  # v2专用: 软标签温度参数
-  cover_loss_weight: 0.1  # v2专用: Cover损失权重
+  wta_loss_version: v3  # 可选: v1 或 v2
+  wta_temperature: 1.5  # v2专用: 软标签温度参数
+  cover_loss_weight: 1.0  # v2专用: Cover损失权重
+  awta_init_temperature: 8.0    # aWTA初始温度
+  awta_exp_base: 0.984
+  awta_min_temperature: 0.1

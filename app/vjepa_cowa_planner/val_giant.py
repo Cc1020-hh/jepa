@@ -118,48 +118,111 @@ def compute_minade_minfde_k(pred_trajs: torch.Tensor, gt_traj: torch.Tensor) -> 
     }
 
 
-def prepare_status_feature(states, actions, mode: str = "last"):
-    """从 states 和 actions 提取状态特征 (与 train_giant.py 保持一致)。"""
+def get_status_dim(status_mode: str, num_context_frames: int = 1) -> int:
+    """返回 prepare_status_feature 在给定 status_mode 下的输出维度。"""
+    if status_mode == "ego_history_sequence":
+        return num_context_frames * 3
+    elif status_mode == "current_only":
+        return 5
+    elif status_mode == "current_plus_command":
+        return 9
+    elif status_mode == "history_trajectory":
+        return num_context_frames * 3 + 2
+    elif status_mode == "raw_states":
+        return 7
+    else:
+        raise ValueError(f"Unknown status_mode: {status_mode}")
+
+
+def prepare_status_feature(
+    states: torch.Tensor,
+    actions: torch.Tensor,
+    status_mode: str = "current_only",
+    num_context_frames: int = 1,
+    straight_thresh: float = 0.3,
+    uturn_thresh: float = 2.5,
+) -> torch.Tensor:
+    """从 states 提取 planner 状态特征，统一输出 [B, status_dim]。
+
+    states: [B, T, 7]  —  每帧 [x, y, z, roll, pitch, yaw, velocity]
+    """
     B = states.shape[0]
-    if mode == "first":
-        idx = 0
-        velocity = states[:, idx, 6:7]
-        if states.shape[1] >= 2:
-            acceleration = states[:, 1, 6:7] - states[:, 0, 6:7]
-        else:
-            acceleration = torch.zeros_like(velocity)
-        yaw = states[:, idx, 5:6]
-        xy = states[:, idx, 0:2]
-        if actions is not None and actions.shape[1] > 0:
-            action_feat = actions[:, 0, :3]
-        else:
-            action_feat = torch.zeros(B, 3, device=states.device, dtype=states.dtype)
-    elif mode == "history_pool":
-        velocity = states[:, :, 6:7].mean(dim=1)
-        if states.shape[1] >= 2:
-            dv = states[:, 1:, 6:7] - states[:, :-1, 6:7]
-            acceleration = dv.mean(dim=1)
-        else:
-            acceleration = torch.zeros_like(velocity)
-        yaw = states[:, :, 5:6].mean(dim=1)
-        xy = states[:, :, 0:2].mean(dim=1)
-        if actions is not None and actions.shape[1] > 0:
-            action_feat = actions[:, :, :3].mean(dim=1)
-        else:
-            action_feat = torch.zeros(B, 3, device=states.device, dtype=states.dtype)
-    else:  # "last"
-        velocity = states[:, -1, 6:7]
-        if states.shape[1] >= 2:
-            acceleration = states[:, -1, 6:7] - states[:, -2, 6:7]
-        else:
-            acceleration = torch.zeros_like(velocity)
-        yaw = states[:, -1, 5:6]
-        xy = states[:, -1, 0:2]
-        if actions is not None and actions.shape[1] > 0:
-            action_feat = actions[:, -1, :3]
-        else:
-            action_feat = torch.zeros(B, 3, device=states.device, dtype=states.dtype)
-    return torch.cat([velocity, acceleration, yaw, xy, action_feat], dim=-1)  # [B, 8]
+    T = states.shape[1]
+    ncf = min(num_context_frames, T)
+    cur_idx = ncf - 1
+
+    if status_mode == "ego_history_sequence":
+        feats = []
+        for t in range(ncf):
+            vel = states[:, t, 6:7]
+            if t > 0:
+                acc = states[:, t, 6:7] - states[:, t - 1, 6:7]
+                dyaw = torch.atan2(
+                    torch.sin(states[:, t, 5:6] - states[:, t - 1, 5:6]),
+                    torch.cos(states[:, t, 5:6] - states[:, t - 1, 5:6]),
+                )
+            else:
+                acc = torch.zeros_like(vel)
+                dyaw = torch.zeros_like(vel)
+            feats.append(torch.cat([vel, acc, dyaw], dim=-1))
+        return torch.cat(feats, dim=-1)
+
+    elif status_mode == "current_only":
+        vel = states[:, cur_idx, 6:7]
+        acc = (states[:, cur_idx, 6:7] - states[:, cur_idx - 1, 6:7]) if cur_idx > 0 else torch.zeros_like(vel)
+        yaw = states[:, cur_idx, 5:6]
+        xy = states[:, cur_idx, 0:2]
+        return torch.cat([vel, acc, yaw, xy], dim=-1)
+
+    elif status_mode == "current_plus_command":
+        vel = states[:, cur_idx, 6:7]
+        acc = (states[:, cur_idx, 6:7] - states[:, cur_idx - 1, 6:7]) if cur_idx > 0 else torch.zeros_like(vel)
+        yaw = states[:, cur_idx, 5:6]
+        xy = states[:, cur_idx, 0:2]
+        ego_feat = torch.cat([vel, acc, yaw, xy], dim=-1)
+
+        yaw_start = states[:, 0, 5]
+        yaw_cur = states[:, cur_idx, 5]
+        delta_yaw = torch.atan2(torch.sin(yaw_cur - yaw_start), torch.cos(yaw_cur - yaw_start))
+        abs_delta = torch.abs(delta_yaw)
+
+        cmd = torch.zeros(B, 4, device=states.device, dtype=states.dtype)
+        cmd[:, 0] = (abs_delta < straight_thresh).float()
+        cmd[:, 1] = ((delta_yaw > straight_thresh) & (abs_delta < uturn_thresh)).float()
+        cmd[:, 2] = ((delta_yaw < -straight_thresh) & (abs_delta < uturn_thresh)).float()
+        cmd[:, 3] = (abs_delta >= uturn_thresh).float()
+
+        return torch.cat([ego_feat, cmd], dim=-1)
+
+    elif status_mode == "history_trajectory":
+        cur_x = states[:, cur_idx, 0]
+        cur_y = states[:, cur_idx, 1]
+        cur_yaw = states[:, cur_idx, 5]
+        cos_h = torch.cos(-cur_yaw)
+        sin_h = torch.sin(-cur_yaw)
+
+        traj_feats = []
+        for t in range(ncf):
+            dx_world = states[:, t, 0] - cur_x
+            dy_world = states[:, t, 1] - cur_y
+            dx_ego = cos_h * dx_world - sin_h * dy_world
+            dy_ego = sin_h * dx_world + cos_h * dy_world
+            dyaw = torch.atan2(
+                torch.sin(states[:, t, 5] - cur_yaw),
+                torch.cos(states[:, t, 5] - cur_yaw),
+            )
+            traj_feats.append(torch.stack([dx_ego, dy_ego, dyaw], dim=-1))
+        traj_flat = torch.cat(traj_feats, dim=-1)
+
+        vel = states[:, cur_idx, 6:7]
+        acc = (states[:, cur_idx, 6:7] - states[:, cur_idx - 1, 6:7]) if cur_idx > 0 else torch.zeros_like(vel)
+        return torch.cat([traj_flat, vel, acc], dim=-1)
+
+    elif status_mode == "raw_states":
+        return states[:, cur_idx, :]
+
+    else:
+        raise ValueError(f"Unknown status_mode: {status_mode}")
 
 
 @torch.no_grad()
@@ -180,12 +243,13 @@ def validate_one_epoch(
     rank,
     epoch,
     normalize_reps: bool = True,
-    status_mode: str = "last",
+    status_mode: str = "current_only",
     z_ar_mode: str = "full",
     use_z_context: bool = False,
+    num_context_frames: int = 1,
 ) -> dict:
     """
-    执行一个完整epoch的验证 (与 train_giant.py 逻辑一致)
+    执行一个完整epoch的验证 (与 train_context.py 逻辑一致)
 
     Args:
         encoder: 编码器模型 (可能是DDP包装)
@@ -204,6 +268,8 @@ def validate_one_epoch(
         rank: 当前进程rank
         epoch: 当前epoch
         normalize_reps: 是否对表示进行归一化
+        status_mode: 状态特征模式 (ego_history_sequence/current_only/current_plus_command/history_trajectory/raw_states)
+        num_context_frames: z_context 模式下使用的帧数（历史帧+当前帧总和）
 
     Returns:
         metrics: 包含平均 ADE, FDE 的字典
@@ -286,12 +352,26 @@ def validate_one_epoch(
                 z_ar_planner = z_ar if z_ar_mode == "full" else z_ar[:, :tokens_per_frame]
 
                 # ==================== Planner Forward ====================
-                status_feature = prepare_status_feature(states, actions, mode=status_mode)
-                planner_output = planner_unwrapped(
-                    z_ar_planner,
-                    status_feature,
-                    z_context=z if use_z_context else None,
+                status_feature = prepare_status_feature(
+                    states, actions,
+                    status_mode=status_mode,
+                    num_context_frames=num_context_frames,
                 )
+                if num_context_frames > 0:
+                    z_planner_input = z[:, :num_context_frames * tokens_per_frame]
+                    planner_output = planner_unwrapped(z_planner_input, status_feature)
+                elif use_z_context:
+                    z_first_frame = z[:, :tokens_per_frame]
+                    planner_output = planner_unwrapped(
+                        z_ar_planner,
+                        status_feature,
+                        z_context=z_first_frame,
+                    )
+                else:
+                    planner_output = planner_unwrapped(
+                        z_ar_planner,
+                        status_feature,
+                    )
 
                 # 支持多模态 planner
                 pred_trajs = None
@@ -460,15 +540,17 @@ def run_validation(
     cfgs_loss = config.get("loss", {})
     normalize_reps = cfgs_loss.get("normalize_reps", True)
     cfgs_planner = config.get("planner", {})
-    status_mode = cfgs_planner.get("status_mode", "last")
+    status_mode = cfgs_planner.get("status_mode", "current_only")
     z_ar_mode = cfgs_planner.get("z_ar_mode", "full")
     use_z_context = cfgs_planner.get("use_z_context", False)
+    num_context_frames = cfgs_planner.get("num_context_frames", 0)
     assert z_ar_mode in ("full", "first_step"), f"Invalid planner.z_ar_mode={z_ar_mode}"
 
     logger.info(f"Starting validation for epoch {epoch}...")
     logger.info(f"Validation config: tokens_per_frame={tokens_per_frame}, num_poses={num_poses}, "
                 f"num_time_steps={num_time_steps}, normalize_reps={normalize_reps}, "
-                f"status_mode={status_mode}, z_ar_mode={z_ar_mode}, use_z_context={use_z_context}")
+                f"status_mode={status_mode}, z_ar_mode={z_ar_mode}, "
+                f"use_z_context={use_z_context}, num_context_frames={num_context_frames}")
 
     metrics = validate_one_epoch(
         encoder=encoder,
@@ -490,6 +572,7 @@ def run_validation(
         status_mode=status_mode,
         z_ar_mode=z_ar_mode,
         use_z_context=use_z_context,
+        num_context_frames=num_context_frames,
     )
 
     if rank == 0:

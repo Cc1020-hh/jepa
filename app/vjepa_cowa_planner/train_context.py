@@ -37,7 +37,7 @@ from app.vjepa_cowa.seg_head2 import SimpleSemanticSegHead
 from  app.vjepa_cowa.co_detr_decoder import CoDetrDecoder
 from Drive_JEPA.navsim_v1.navsim.agents.drive_jepa_perception_free.drive_jepa_model import TrajectoryHead
 # ==================== 新增：评估模块导入 ====================
-from app.vjepa_cowa_planner.val_giant import run_validation
+from app.vjepa_cowa_planner.val_context import run_validation
 # ==================== 新增：Seg Head相关导入 ====================
 # from ddddet.modeling.utils.weight_init import c2_xavier_fill
 
@@ -56,23 +56,15 @@ logger = get_logger(__name__, force=True)
 
 class MultiModalTemporalPlanner(nn.Module):
     """
-    多模态 Planner (支持单帧预测和时序预测)
+    多模态 Context Planner — 始终以 encoder 输出 (z_context) 作为输入。
+
+    通过 num_context_frames 参数控制输入帧数（历史帧 + 当前帧的总和）:
+    - num_context_frames == 1: 单帧模式，仅使用当前帧
+    - num_context_frames  > 1: 时序模式，使用历史帧 + 当前帧，
+      并可选时序对齐 bias 让 query 关注对应时间步的 memory token
+
     输出 K 条轨迹 + K 个置信度 logit。
     损失计算在外部 wta_loss() 中完成，forward 只负责推理。
-
-    通过 use_temporal 参数控制:
-    - use_temporal=False: 单帧预测 (只使用第一帧)
-    - use_temporal=True: 时序预测 (使用所有历史帧)
-
-    通过 use_z_context 参数控制 planner 输入来源:
-    - use_z_context=False: 使用 z_ar (predictor 预测的未来表征)
-    - use_z_context=True: 使用 z_context (encoder 编码的第一帧/当前帧)
-      此模式下强制走单帧路径，推理时只需编码当前帧即可。
-
-    时序对齐约束 (use_temporal=True 时启用):
-    - 使用 additive distance bias 在 cross-attention logit 上软约束
-      第 i 个 query 更关注第 i 个时间步的 memory token
-    - 不引入额外可学习参数，不与已有 PE 冲突
     """
 
     def __init__(
@@ -85,15 +77,13 @@ class MultiModalTemporalPlanner(nn.Module):
         tf_dropout: float = 0.0,
         tokens_per_frame: int = 256,
         num_poses: int = 7,
-        num_time_steps: int = 7,
+        num_context_frames: int = 1,
         status_dim: int = 7,
         use_spatial_tokens: bool = False,
         num_modes: int = 6,
-        use_temporal: bool = False,
         use_time_aligned_bias: bool = True,
-        time_aligned_bias_strength: float = 5.0,  # 初始值，会作为可学习参数的初始化
-        use_z_context: bool = False,
-        use_status_for_planner: bool = True,  # 是否使用 status 特征
+        time_aligned_bias_strength: float = 5.0,
+        use_status_for_planner: bool = True,
     ):
         super().__init__()
 
@@ -101,26 +91,20 @@ class MultiModalTemporalPlanner(nn.Module):
         self.tf_d_model = tf_d_model
         self.tokens_per_frame = tokens_per_frame
         self.num_poses = num_poses
-        self.num_time_steps = num_time_steps
+        self.num_context_frames = num_context_frames
         self.use_spatial_tokens = use_spatial_tokens
         self.num_modes = num_modes
-        self.use_temporal = use_temporal
+        self.use_temporal = num_context_frames > 1
         self.use_time_aligned_bias = use_time_aligned_bias
-        self.use_z_context = use_z_context
         self.use_status_for_planner = use_status_for_planner
 
         # ==================== 时序对齐：可学习的 bias 强度 ====================
-        # 将 strength 设为可学习参数，让模型自己学习最合适的时序约束强度
-        # 使用 log 空间存储，通过 exp() 保证 strength > 0
-        # strength = exp(log_strength) ∈ (0, +∞)
-        if use_temporal and use_time_aligned_bias:
-            # 初始化 log(strength)，使得 exp(log_strength) ≈ time_aligned_bias_strength
+        if self.use_temporal and use_time_aligned_bias:
             init_log_strength = math.log(max(time_aligned_bias_strength, 0.01))
             self.log_time_aligned_bias_strength = nn.Parameter(
                 torch.tensor(init_log_strength, dtype=torch.float32)
             )
         else:
-            # 不使用时，注册一个 dummy buffer 避免属性不存在的问题
             self.register_buffer(
                 "log_time_aligned_bias_strength",
                 torch.tensor(0.0, dtype=torch.float32),
@@ -130,11 +114,6 @@ class MultiModalTemporalPlanner(nn.Module):
         # ==================== 共享组件 ====================
         self.query_embedding = nn.Embedding(num_modes * num_poses, tf_d_model)
 
-        # ==================== 时序对齐：Query 时间步索引 ====================
-        # 每个 mode 有 num_poses 个 query token，第 i 个 query 负责预测第 i 个未来时间步
-        # 例如 num_poses=7, num_modes=6 时:
-        #   query_step_idx = [0,1,2,3,4,5,6, 0,1,2,3,4,5,6, ...] (重复6次)
-        #   含义: query[0] 预测 t=0, query[1] 预测 t=1, ..., query[6] 预测 t=6
         query_step_idx = torch.arange(num_poses, dtype=torch.long).repeat(num_modes)
         self.register_buffer("query_step_idx", query_step_idx, persistent=False)
 
@@ -159,19 +138,16 @@ class MultiModalTemporalPlanner(nn.Module):
             nn.Linear(tf_d_ffn, num_modes),
         )
 
-        # ==================== 根据 use_temporal 选择不同结构 ====================
-        if use_temporal:
+        # ==================== 根据 num_context_frames 选择结构 ====================
+        if self.use_temporal:
             if use_spatial_tokens:
                 self.temporal_fc = nn.Linear(encoder_dim, tf_d_model)
             else:
                 self.temporal_fc = nn.Linear(encoder_dim * tokens_per_frame, tf_d_model)
 
-            num_kv = (tokens_per_frame if use_spatial_tokens else 1) * num_time_steps + (1 if use_status_for_planner else 0)
+            num_kv = (tokens_per_frame if use_spatial_tokens else 1) * num_context_frames + (1 if use_status_for_planner else 0)
             self.temporal_embedding = nn.Embedding(num_kv, tf_d_model)
-
-        # 单帧路径的层：use_temporal=False 时必需；
-        # use_temporal=True + use_z_context=True 时也需要（z_context 只有第一帧，走单帧路径）
-        if not use_temporal or use_z_context:
+        else:
             self.image_fc = nn.Linear(encoder_dim, tf_d_model)
             if use_spatial_tokens:
                 num_keyval = tokens_per_frame + (1 if use_status_for_planner else 0)
@@ -190,81 +166,76 @@ class MultiModalTemporalPlanner(nn.Module):
     # ─────────────────────────────────────────────────────────────────
     def _build_memory_temporal(
         self,
-        z_ar: torch.Tensor,
+        z_context: torch.Tensor,
         status_feature: torch.Tensor,
     ) -> tuple:
-        """构建时序预测的 memory 和每个 token 的时间步索引。
+        """构建多帧时序 memory 和每个 token 的时间步索引。
+
+        Args:
+            z_context: [B, num_context_frames * tokens_per_frame, D]
+            status_feature: [B, status_dim]
 
         Returns:
             memory: [B, M, d]
             memory_step_idx: [M] 每个 memory token 的时间步索引，-1 表示不参与对齐
         """
-        B = z_ar.shape[0]
-        T = self.num_time_steps
+        B = z_context.shape[0]
+        T = self.num_context_frames
         P = self.tokens_per_frame
         D = self.encoder_dim
 
         expected_tokens = T * P
-        assert z_ar.ndim == 3, f"Expected z_ar shape [B, N, D], got ndim={z_ar.ndim}"
-        assert z_ar.shape[1] == expected_tokens, (
-            f"Planner memory reshape mismatch: got N={z_ar.shape[1]}, "
-            f"expected num_time_steps*tokens_per_frame={T}*{P}={expected_tokens}"
+        assert z_context.ndim == 3, f"Expected z_context shape [B, N, D], got ndim={z_context.ndim}"
+        assert z_context.shape[1] == expected_tokens, (
+            f"Planner memory reshape mismatch: got N={z_context.shape[1]}, "
+            f"expected num_context_frames*tokens_per_frame={T}*{P}={expected_tokens}"
         )
-        assert z_ar.shape[2] == D, (
-            f"Planner channel mismatch: got D={z_ar.shape[2]}, expected encoder_dim={D}"
+        assert z_context.shape[2] == D, (
+            f"Planner channel mismatch: got D={z_context.shape[2]}, expected encoder_dim={D}"
         )
-        z_ar_reshaped = z_ar.view(B, T, P, D)
+        z_reshaped = z_context.view(B, T, P, D)
 
-        # ==================== 时序对齐：Memory 时间步索引 ====================
-        # 记录每个 memory token 来自哪个历史时间步
         if self.use_spatial_tokens:
-            # 保留空间 token: 每个 time step 有 P 个 token
-            # memory_step_idx = [0,0,...,0, 1,1,...,1, ..., T-1,T-1,...,T-1]
-            #                   |---P个---|  |---P个---|       |---P个---|
-            feat = self.temporal_fc(z_ar_reshaped).view(B, T * P, -1)
-            memory_step_idx = torch.arange(T, device=z_ar.device, dtype=torch.long).repeat_interleave(P)
+            feat = self.temporal_fc(z_reshaped).view(B, T * P, -1)
+            memory_step_idx = torch.arange(T, device=z_context.device, dtype=torch.long).repeat_interleave(P)
         else:
-            # 空间池化: 每个 time step 只有 1 个 token
-            # memory_step_idx = [0, 1, 2, ..., T-1]
-            feat = self.temporal_fc(z_ar_reshaped.reshape(B, T, P * D))
-            memory_step_idx = torch.arange(T, device=z_ar.device, dtype=torch.long)
+            feat = self.temporal_fc(z_reshaped.reshape(B, T, P * D))
+            memory_step_idx = torch.arange(T, device=z_context.device, dtype=torch.long)
 
         T_feat = feat.shape[1]
-
         feat = feat + self.temporal_embedding.weight[:T_feat].unsqueeze(0)
 
         if self.use_status_for_planner:
             status = self.status_encoding(status_feature).unsqueeze(1)
             status = status + self.temporal_embedding.weight[T_feat:T_feat + 1].unsqueeze(0)
 
-            # Status token 的时间步索引设为 -1，表示"不参与时序对齐"
-            # 在 _build_time_aligned_memory_bias 中会对 idx=-1 的 token 特殊处理
-            status_step_idx = torch.full((1,), -1, device=z_ar.device, dtype=torch.long)
+            status_step_idx = torch.full((1,), -1, device=z_context.device, dtype=torch.long)
             memory_step_idx = torch.cat([memory_step_idx, status_step_idx], dim=0)
 
-            # 返回 memory 序列及其对应的时间步索引
-            # memory: [B, T*P+1 或 T+1, d] - 最后一个是 status token
-            # memory_step_idx: [T*P+1 或 T+1] - 每个位置的时间步索引
             return torch.cat([feat, status], dim=1), memory_step_idx
         else:
-            # 不使用 status 时直接返回 feat
             return feat, memory_step_idx
 
     # ─────────────────────────────────────────────────────────────────
     def _build_memory_single(
         self,
-        z_ar: torch.Tensor,
+        z_context: torch.Tensor,
         status_feature: torch.Tensor,
     ) -> torch.Tensor:
-        """构建单帧预测的 memory。"""
-        B = z_ar.shape[0]
+        """构建单帧 memory (num_context_frames == 1)。
 
-        z_last = z_ar[:, :self.tokens_per_frame]
+        Args:
+            z_context: [B, tokens_per_frame, D]  单帧 encoder 输出
+            status_feature: [B, status_dim]
+        """
+        B = z_context.shape[0]
+
+        z_frame = z_context[:, :self.tokens_per_frame]
 
         if self.use_spatial_tokens:
-            img_feat = self.image_fc(z_last)
+            img_feat = self.image_fc(z_frame)
         else:
-            z_pooled = z_last.mean(dim=1)
+            z_pooled = z_frame.mean(dim=1)
             img_feat = self.image_fc(z_pooled)
             img_feat = img_feat.unsqueeze(1)
 
@@ -290,21 +261,6 @@ class MultiModalTemporalPlanner(nn.Module):
     ) -> torch.Tensor:
         """构建时间对齐 bias [Q, M]，加到 decoder cross-attn logit 上。
 
-        核心思想：
-        - 第 i 个 query 负责预测第 i 个未来时间步的轨迹点
-        - 应该让第 i 个 query 更关注第 i 个历史时间步的 memory token
-        - 时间步距离越远，attention 权重应该越低（通过负 bias 实现）
-
-        例如 num_poses=7, num_time_steps=7 时:
-        - query_step_idx[0]=0 应该更关注 memory_step_idx=0 (当前帧)
-        - query_step_idx[6]=6 应该更关注 memory_step_idx=6 (最远历史帧)
-
-        数学形式：
-        - distance = |query_step - memory_step|
-        - bias = -strength * (distance / max_distance)
-        - distance=0 时 bias=0 (无惩罚)
-        - distance 越大 bias 越负 (惩罚越大，attention 权重越低)
-
         Args:
             query_step_idx:  [Q]  每个 query 的时间步索引
             memory_step_idx: [M]  每个 memory token 的时间步索引，-1 表示不参与对齐
@@ -316,27 +272,19 @@ class MultiModalTemporalPlanner(nn.Module):
         Q = query_step_idx.shape[0]
         M = memory_step_idx.shape[0]
 
-        # 计算实际的 time_aligned_bias_strength (从 log 空间转换)
         time_aligned_bias_strength = torch.exp(self.log_time_aligned_bias_strength)
 
-        # 如果未启用时序对齐，返回全零 bias（无约束）
         if (not self.use_time_aligned_bias) or time_aligned_bias_strength <= 0:
             return torch.zeros(Q, M, device=query_step_idx.device, dtype=dtype)
 
-        # 广播计算时间步距离矩阵
-        # q: [Q, 1], m: [1, M] -> distance: [Q, M]
         q = query_step_idx.to(torch.float32).unsqueeze(1)   # [Q, 1]
         m = memory_step_idx.to(torch.float32).unsqueeze(0)  # [1, M]
         distance = (q - m).abs()                             # [Q, M]
 
-        # 归一化因子：最大可能的时间步距离
-        norm = max(1.0, float(self.num_time_steps - 1))
+        norm = max(1.0, float(self.num_context_frames - 1))
 
-        # 计算 bias: 距离越远，bias 越负（惩罚越大）
-        # distance=0 -> bias=0, distance=norm -> bias=-strength
         bias = -time_aligned_bias_strength * (distance / norm)  # [Q, M]
 
-        # 特殊处理：status token (idx=-1) 不参与时序对齐，bias 设为 0
         status_mask = memory_step_idx.eq(-1).unsqueeze(0)    # [1, M]
         bias = torch.where(status_mask, torch.zeros_like(bias), bias)
 
@@ -345,16 +293,14 @@ class MultiModalTemporalPlanner(nn.Module):
     # ─────────────────────────────────────────────────────────────────
     def forward(
         self,
-        z_ar: torch.Tensor,
+        z_context: torch.Tensor,
         status_feature: torch.Tensor,
-        z_context: torch.Tensor = None,
     ) -> dict:
         """
         Parameters
         ----------
-        z_ar           : [B, N, D]  autoregressive prediction tokens
+        z_context      : [B, num_context_frames * tokens_per_frame, D]  encoder 输出
         status_feature : [B, status_dim]
-        z_context      : [B, N', D] encoder output tokens (optional, used when use_z_context=True)
 
         Returns
         -------
@@ -362,43 +308,23 @@ class MultiModalTemporalPlanner(nn.Module):
             "trajectories" : [B, K, num_poses, 3]   (x, y, yaw)
             "confidences"  : [B, K]                  unnormalized logits
         """
-        # 根据 use_z_context 开关选择 planner 的实际输入
-        if self.use_z_context:
-            assert z_context is not None, (
-                "use_z_context=True but z_context is None. "
-                "Please pass z_context (first-frame encoder output) to planner.forward()."
-            )
-            planner_input = z_context
-        else:
-            planner_input = z_ar
-
-        B = planner_input.shape[0]
+        B = z_context.shape[0]
         K = self.num_modes
 
-        # use_z_context=True 时只有第一帧的 encoder 输出，强制走单帧路径
-        use_temporal_path = self.use_temporal and not self.use_z_context
+        if self.use_temporal:
+            memory, memory_step_idx = self._build_memory_temporal(z_context, status_feature)
 
-        if use_temporal_path:
-            # 时序模式：构建 memory 并返回时间步索引用于计算对齐 bias
-            memory, memory_step_idx = self._build_memory_temporal(planner_input, status_feature)
-
-            # ==================== 时序对齐：构建 Attention Bias ====================
             memory_bias = self._build_time_aligned_memory_bias(
-                self.query_step_idx,  # [K*num_poses] 每个 query 的时间步
-                memory_step_idx,      # [M] 每个 memory token 的时间步
+                self.query_step_idx,
+                memory_step_idx,
                 dtype=memory.dtype,
             )
         else:
-            # 单帧模式（或 use_z_context 模式）：不需要时序对齐
-            memory = self._build_memory_single(planner_input, status_feature)
+            memory = self._build_memory_single(z_context, status_feature)
             memory_bias = None
 
         query = self.query_embedding.weight.unsqueeze(0).expand(B, -1, -1)
 
-        # Transformer decoder 的 cross-attention 会使用 memory_mask
-        # memory_mask (即 memory_bias) 被加到 Q·K^T 的 attention score 上:
-        #   attention_weight = softmax(Q·K^T + memory_bias)
-        # 负的 bias 会降低对应位置的 attention 权重
         if memory_bias is not None:
             query_out = self.transformer(src=memory, tgt=query, memory_mask=memory_bias)
         else:
@@ -849,92 +775,124 @@ def l1_length_normalized_loss(pred, gt, alpha=5.0, eps=1e-6):
     return (w * per_sample_l1).mean()
 
 
-def prepare_status_feature(states, actions, mode: str = "first", use_drive_command: bool = False,
-                           use_states_for_planner: bool = False, action_dim: int = 7,
-                           straight_thresh: float = 0.3, uturn_thresh: float = 2.5):
-    """从 states 和 actions 提取状态特征。
+def get_status_dim(status_mode: str, num_context_frames: int = 1) -> int:
+    """返回 prepare_status_feature 在给定 status_mode 下的输出维度。"""
+    if status_mode == "ego_history_sequence":
+        return num_context_frames * 3  # [vel, acc, yaw_rate] * T
+    elif status_mode == "current_only":
+        return 5  # [vel, acc, yaw, x, y]
+    elif status_mode == "current_plus_command":
+        return 9  # [vel, acc, yaw, x, y] + [4-dim one-hot command]
+    elif status_mode == "history_trajectory":
+        return num_context_frames * 3 + 2  # ego-centric [dx, dy, dyaw] * T + [vel, acc]
+    elif status_mode == "raw_states":
+        return 7  # [x, y, z, roll, pitch, yaw, velocity]
+    else:
+        raise ValueError(f"Unknown status_mode: {status_mode}")
 
-    mode:
-        - "last": 使用最后一个时
-        - "first": 使用起始时刻
-        - "history_pool": 对时序做均值池化
 
-    use_drive_command:
-        - 如果为 True，使用 drive_command 替换原始 states 信息
-        - action_dim=7: 前4维 one-hot + 后3维 0填充，输出 [B, 7]
-        - action_dim=4: 纯 one-hot [GO_STRAIGHT, TURN_LEFT, TURN_RIGHT, U_TURN]，输出 [B, 4]
+def prepare_status_feature(
+    states: torch.Tensor,
+    actions: torch.Tensor,
+    status_mode: str = "current_only",
+    num_context_frames: int = 1,
+    straight_thresh: float = 0.3,
+    uturn_thresh: float = 2.5,
+) -> torch.Tensor:
+    """从 states 提取 planner 状态特征，统一输出 [B, status_dim]。
 
-    use_states_for_planner:
-        - 如果为 True，直接使用原始 states（维度 7），与 predictor 保持一致
-        - 根据 mode 选择对应时间步的 states
+    states: [B, T, 7]  —  每帧 [x, y, z, roll, pitch, yaw, velocity]
+    actions: [B, T-1, action_dim]  （本函数未使用，保留接口兼容）
+
+    status_mode:
+        - "ego_history_sequence": 多帧 [velocity, acceleration, yaw_rate]，对齐 num_context_frames
+        - "current_only":         当前帧 [velocity, acceleration, yaw, x, y]
+        - "current_plus_command": current_only + 基于历史帧 yaw 趋势的 drive_command (4-dim)
+        - "history_trajectory":   ego-centric 历史轨迹 [dx, dy, dyaw] * T + [velocity, acceleration]
+        - "raw_states":           当前帧原始 states [x, y, z, roll, pitch, yaw, velocity]
     """
     B = states.shape[0]
+    T = states.shape[1]
+    ncf = min(num_context_frames, T)
+    cur_idx = ncf - 1  # "当前帧" = context 窗口的最后一帧
 
-    if use_drive_command:
-        # 计算 drive_command（基于 delta_yaw 首尾差）
-        yaw = states[:, :, 5]  # [B, T]
-        yaw_start = yaw[:, 0]  # [B]
-        yaw_end = yaw[:, -1]   # [B]
-        delta_yaw = torch.atan2(torch.sin(yaw_end - yaw_start), torch.cos(yaw_end - yaw_start))  # [B]
+    if status_mode == "ego_history_sequence":
+        # 每帧: [velocity, acceleration, yaw_rate]
+        feats = []
+        for t in range(ncf):
+            vel = states[:, t, 6:7]  # [B, 1]
+            if t > 0:
+                acc = states[:, t, 6:7] - states[:, t - 1, 6:7]
+                dyaw = torch.atan2(
+                    torch.sin(states[:, t, 5:6] - states[:, t - 1, 5:6]),
+                    torch.cos(states[:, t, 5:6] - states[:, t - 1, 5:6]),
+                )
+            else:
+                acc = torch.zeros_like(vel)
+                dyaw = torch.zeros_like(vel)
+            feats.append(torch.cat([vel, acc, dyaw], dim=-1))  # [B, 3]
+        return torch.cat(feats, dim=-1)  # [B, ncf * 3]
 
+    elif status_mode == "current_only":
+        vel = states[:, cur_idx, 6:7]
+        acc = (states[:, cur_idx, 6:7] - states[:, cur_idx - 1, 6:7]) if cur_idx > 0 else torch.zeros_like(vel)
+        yaw = states[:, cur_idx, 5:6]
+        xy = states[:, cur_idx, 0:2]
+        return torch.cat([vel, acc, yaw, xy], dim=-1)  # [B, 5]
+
+    elif status_mode == "current_plus_command":
+        # current_only 部分
+        vel = states[:, cur_idx, 6:7]
+        acc = (states[:, cur_idx, 6:7] - states[:, cur_idx - 1, 6:7]) if cur_idx > 0 else torch.zeros_like(vel)
+        yaw = states[:, cur_idx, 5:6]
+        xy = states[:, cur_idx, 0:2]
+        ego_feat = torch.cat([vel, acc, yaw, xy], dim=-1)  # [B, 5]
+
+        # 基于历史帧 yaw 趋势估计 drive_command（不依赖未来帧）
+        yaw_start = states[:, 0, 5]
+        yaw_cur = states[:, cur_idx, 5]
+        delta_yaw = torch.atan2(torch.sin(yaw_cur - yaw_start), torch.cos(yaw_cur - yaw_start))
         abs_delta = torch.abs(delta_yaw)
-        drive_cmd = torch.zeros(B, action_dim, device=states.device, dtype=states.dtype)
-        drive_cmd[:, 0] = (abs_delta < straight_thresh).float()  # GO_STRAIGHT
-        drive_cmd[:, 1] = ((delta_yaw > straight_thresh) & (abs_delta < uturn_thresh)).float()  # TURN_LEFT
-        drive_cmd[:, 2] = ((delta_yaw < -straight_thresh) & (abs_delta < uturn_thresh)).float()  # TURN_RIGHT
-        drive_cmd[:, 3] = (abs_delta >= uturn_thresh).float()  # U_TURN
 
-        return drive_cmd  # [B, action_dim]
+        cmd = torch.zeros(B, 4, device=states.device, dtype=states.dtype)
+        cmd[:, 0] = (abs_delta < straight_thresh).float()
+        cmd[:, 1] = ((delta_yaw > straight_thresh) & (abs_delta < uturn_thresh)).float()
+        cmd[:, 2] = ((delta_yaw < -straight_thresh) & (abs_delta < uturn_thresh)).float()
+        cmd[:, 3] = (abs_delta >= uturn_thresh).float()
 
-    if use_states_for_planner:
-        # 直接使用原始 states，与 predictor 保持一致
-        if mode == "first":
-            return states[:, 0, :]  # [B, 7]
-        elif mode == "last":
-            return states[:, -1, :]  # [B, 7]
-        else:  # history_pool
-            return states.mean(dim=1)  # [B, 7]
+        return torch.cat([ego_feat, cmd], dim=-1)  # [B, 9]
 
-    if mode == "first":
-        idx = 0
-        velocity = states[:, idx, 6:7]
-        if states.shape[1] >= 2:
-            acceleration = states[:, 1, 6:7] - states[:, 0, 6:7]
-        else:
-            acceleration = torch.zeros_like(velocity)
-        yaw = states[:, idx, 5:6]
-        xy = states[:, idx, 0:2]
-        if actions is not None and actions.shape[1] > 0:
-            action_feat = actions[:, 0, :3]
-        else:
-            action_feat = torch.zeros(B, 3, device=states.device, dtype=states.dtype)
-    elif mode == "history_pool":
-        velocity = states[:, :, 6:7].mean(dim=1)
-        if states.shape[1] >= 2:
-            dv = states[:, 1:, 6:7] - states[:, :-1, 6:7]
-            acceleration = dv.mean(dim=1)
-        else:
-            acceleration = torch.zeros_like(velocity)
-        yaw = states[:, :, 5:6].mean(dim=1)
-        xy = states[:, :, 0:2].mean(dim=1)
-        if actions is not None and actions.shape[1] > 0:
-            action_feat = actions[:, :, :3].mean(dim=1)
-        else:
-            action_feat = torch.zeros(B, 3, device=states.device, dtype=states.dtype)
-    else:  # "last"
-        velocity = states[:, -1, 6:7]  # [B, 1]
-        if states.shape[1] >= 2:
-            acceleration = states[:, -1, 6:7] - states[:, -2, 6:7]
-        else:
-            acceleration = torch.zeros_like(velocity)
-        yaw = states[:, -1, 5:6]  # [B, 1]
-        xy = states[:, -1, 0:2]  # [B, 2]
-        if actions is not None and actions.shape[1] > 0:
-            action_feat = actions[:, -1, :3]
-        else:
-            action_feat = torch.zeros(B, 3, device=states.device, dtype=states.dtype)
+    elif status_mode == "history_trajectory":
+        # 以当前帧为原点，转换历史帧 pose 到 ego-centric 坐标系
+        cur_x = states[:, cur_idx, 0]    # [B]
+        cur_y = states[:, cur_idx, 1]    # [B]
+        cur_yaw = states[:, cur_idx, 5]  # [B]
+        cos_h = torch.cos(-cur_yaw)
+        sin_h = torch.sin(-cur_yaw)
 
-    return torch.cat([velocity, acceleration, yaw, xy, action_feat], dim=-1)  # [B, 8]
+        traj_feats = []
+        for t in range(ncf):
+            dx_world = states[:, t, 0] - cur_x
+            dy_world = states[:, t, 1] - cur_y
+            # 旋转到 ego-centric
+            dx_ego = cos_h * dx_world - sin_h * dy_world  # [B]
+            dy_ego = sin_h * dx_world + cos_h * dy_world  # [B]
+            dyaw = torch.atan2(
+                torch.sin(states[:, t, 5] - cur_yaw),
+                torch.cos(states[:, t, 5] - cur_yaw),
+            )  # [B]
+            traj_feats.append(torch.stack([dx_ego, dy_ego, dyaw], dim=-1))  # [B, 3]
+        traj_flat = torch.cat(traj_feats, dim=-1)  # [B, ncf * 3]
+
+        vel = states[:, cur_idx, 6:7]
+        acc = (states[:, cur_idx, 6:7] - states[:, cur_idx - 1, 6:7]) if cur_idx > 0 else torch.zeros_like(vel)
+        return torch.cat([traj_flat, vel, acc], dim=-1)  # [B, ncf * 3 + 2]
+
+    elif status_mode == "raw_states":
+        return states[:, cur_idx, :]  # [B, 7]
+
+    else:
+        raise ValueError(f"Unknown status_mode: {status_mode}")
 
 
 def prepare_seg_features(
@@ -1291,22 +1249,13 @@ def main(args, resume_preempt=False):
     tf_dropout = cfgs_planner.get("tf_dropout", 0.0)
     planner_loss_weight = cfgs_planner.get("planner_loss_weight", 1.0)
     use_spatial_tokens = cfgs_planner.get("use_spatial_tokens", False)  # 是否保留空间token
-    use_temporal = cfgs_planner.get("use_temporal", False)  # 是否使用时序预测 (True: 时序预测, False: 单帧预测)
+    num_context_frames = cfgs_planner.get("num_context_frames", 1)  # 历史帧+当前帧总数（>=1）
     temporal_alignment = cfgs_planner.get("temporal_alignment", True)  # 时序对齐约束
-    # 以下参数来自 ablation YAML，当前实现仅支持默认值
-    z_ar_mode = cfgs_planner.get("z_ar_mode", "full")
-    time_aligned_bias_scope = cfgs_planner.get("time_aligned_bias_scope", "all_tokens")
-    if z_ar_mode != "full":
-        logger.warning(f"z_ar_mode='{z_ar_mode}' is not implemented, falling back to 'full'")
-    if time_aligned_bias_scope != "all_tokens":
-        logger.warning(f"time_aligned_bias_scope='{time_aligned_bias_scope}' is not implemented, falling back to 'all_tokens'")
     num_modes = cfgs_planner.get("num_modes", 6)
     conf_loss_weight = cfgs_planner.get("conf_loss_weight", 1.0)
     reg_loss_weight = cfgs_planner.get("reg_loss_weight", 1.0)
-    states_mode = cfgs_planner.get("states_mode", "first")  # 状态特征模式: last, first, history_pool
+    status_mode = cfgs_planner.get("status_mode", "current_only")  # ego_history_sequence / current_only / current_plus_command / history_trajectory / raw_states
     use_status_for_planner = cfgs_planner.get("use_status_for_planner", True)  # 是否使用 status 特征
-    use_states_for_planner = cfgs_planner.get("use_states_for_planner", True)  # planner 使用原始 states 作为 status 特征
-    use_z_context = cfgs_planner.get("use_z_context", False)  # True: 用 z_context(encoder输出) 作为planner输入; False: 用 z_ar
     # WTA损失版本选择 (v1: 原版硬标签, v2: 改进版软标签+Cover损失, v3: Annealed WTA)
     wta_loss_version = cfgs_planner.get("wta_loss_version", "v1")
     wta_temperature = cfgs_planner.get("wta_temperature", 1.0)  # v2/v3: 置信度软标签温度
@@ -1553,20 +1502,13 @@ def main(args, resume_preempt=False):
     else:
         seg_head = None
         seg_neck = None
-    # -- PLANNER (单帧/时序预测)
+    # -- PLANNER (context-based: 单帧或多帧)
     num_poses = (target_frame // tubelet_size) - 1
-    num_time_steps = num_poses  # 时序预测时使用的时间步数
     # 获取 encoder 维度 (MultiSeqWrapper 包装后的 encoder 使用 backbone.embed_dim)
     encoder_dim = encoder.backbone.embed_dim
 
     if use_planner:
-        # 根据 use_drive_command_for_predictor 和 use_states_for_planner 决定 status_dim
-        if use_drive_command_for_predictor:
-            planner_status_dim = action_dim  # 4 或 7
-        elif use_states_for_planner:
-            planner_status_dim = 7  # 原始 states 维度（默认值）
-        else:
-            planner_status_dim = 8  # 提取的特征维度
+        planner_status_dim = get_status_dim(status_mode, num_context_frames)
 
         planner = MultiModalTemporalPlanner(
             encoder_dim=encoder_dim,
@@ -1577,33 +1519,21 @@ def main(args, resume_preempt=False):
             tf_dropout=tf_dropout,
             tokens_per_frame=tokens_per_frame,
             num_poses=num_poses,
-            num_time_steps=num_time_steps,
+            num_context_frames=num_context_frames,
             status_dim=planner_status_dim,
             use_spatial_tokens=use_spatial_tokens,
             num_modes=num_modes,
-            use_temporal=use_temporal,
             use_time_aligned_bias=temporal_alignment,
-            use_z_context=use_z_context,
             use_status_for_planner=use_status_for_planner,
         ).to(device)
 
         planner_params = sum(p.numel() for p in planner.parameters())
-        if use_z_context:
-            input_src = "z_context (first-frame encoder output)"
+        input_src = f"z_context (encoder output, {num_context_frames} frame(s))"
+        status_info = f"status_dim={planner_status_dim} (status_mode={status_mode})"
+        if num_context_frames > 1:
+            logger.info(f"planner_params: {planner_params / 1e6:.2f}M (ContextTemporalPlanner, input={input_src}, num_context_frames={num_context_frames}, use_spatial_tokens={use_spatial_tokens}, temporal_alignment={temporal_alignment}, {status_info})")
         else:
-            input_src = "z_ar (predictor output)"
-        if use_drive_command_for_predictor:
-            status_info = f"status_dim={planner_status_dim} (drive_command)"
-        elif use_states_for_planner:
-            status_info = f"status_dim={planner_status_dim} (raw_states)"
-        else:
-            status_info = f"status_dim={planner_status_dim} (extracted)"
-        if use_temporal and use_z_context:
-            logger.info(f"planner_params: {planner_params / 1e6:.2f}M (TemporalPlanner, input={input_src} -> forced single-frame path, use_spatial_tokens={use_spatial_tokens}, {status_info})")
-        elif use_temporal:
-            logger.info(f"planner_params: {planner_params / 1e6:.2f}M (TemporalPlanner, input={input_src}, num_time_steps={num_time_steps}, use_spatial_tokens={use_spatial_tokens}, temporal_alignment={temporal_alignment}, {status_info})")
-        else:
-            logger.info(f"planner_params: {planner_params / 1e6:.2f}M (SingleFramePlanner, input={input_src}, use_spatial_tokens={use_spatial_tokens}, {status_info})")
+            logger.info(f"planner_params: {planner_params / 1e6:.2f}M (ContextSingleFramePlanner, input={input_src}, use_spatial_tokens={use_spatial_tokens}, {status_info})")
     else:
         planner = None
         logger.info("use_planner=False, planner is disabled")
@@ -1736,7 +1666,7 @@ def main(args, resume_preempt=False):
         seg_neck = DistributedDataParallel(seg_neck, find_unused_parameters=False)
 
     if use_planner:
-        has_unused = (not use_status_for_planner) or (use_temporal and use_z_context)
+        has_unused = not use_status_for_planner
         planner = DistributedDataParallel(planner, find_unused_parameters=has_unused)
 
     # 冻结参数
@@ -2208,19 +2138,16 @@ def main(args, resume_preempt=False):
                     if use_planner and planner is not None:
                         B = z_ar.shape[0]
 
-                        # 准备状态特征（支持 drive_command 替换，与 predictor 保持一致）
                         status_feature = prepare_status_feature(
-                            states, actions, mode=states_mode,
-                            use_drive_command=use_drive_command_for_predictor,
-                            use_states_for_planner=use_states_for_planner,
-                            action_dim=action_dim
+                            states, actions,
+                            status_mode=status_mode,
+                            num_context_frames=num_context_frames,
                         )
 
                         # ── Planner forward (多模态) ───────────────────────
-                        # use_z_context=True: 只用第一帧（当前帧）的 encoder 输出，
-                        # 推理时同样只需编码当前帧，不存在信息泄露。
-                        z_first_frame = z_context[:, :tokens_per_frame] if use_z_context else None
-                        planner_out = planner(z_ar, status_feature, z_context=z_first_frame)
+                        # 截取前 num_context_frames 帧的 encoder 输出（历史帧+当前帧，无未来帧泄露）
+                        z_planner_input = z_context[:, :num_context_frames * tokens_per_frame]
+                        planner_out = planner(z_planner_input, status_feature)
                         pred_trajs   = planner_out["trajectories"]   # [B, K, num_poses, 3]
                         pred_conf    = planner_out["confidences"]    # [B, K]
 
