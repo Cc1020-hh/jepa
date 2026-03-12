@@ -107,6 +107,8 @@ train:
   action_dim: 7
   use_states_for_predictor: false  # 不使用states作为predictor输入
   use_drive_command_for_predictor: false
+  predictor_inference_consistent: true  # 推理一致模式：states用drive_cmd+current_state(7维)，未来action置零
+  num_observed_frames: 2  # 推理时可观测帧数（已知action数 = num_observed_frames - 1）
 planner:
   use_planner: true
   tf_d_model: 256

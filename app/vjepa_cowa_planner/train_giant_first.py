@@ -849,6 +849,70 @@ def l1_length_normalized_loss(pred, gt, alpha=5.0, eps=1e-6):
     return (w * per_sample_l1).mean()
 
 
+def prepare_inference_consistent_states(states, straight_thresh=0.3, uturn_thresh=2.5):
+    """
+    构建推理一致的state输入：drive_command + current_state_features
+
+    训练时从GT states计算，推理时drive_command由导航系统提供、state特征由传感器提供。
+    两者格式完全一致，消除train/inference gap。
+
+    states: [B, T, 7] - [x, y, z, roll, pitch, yaw, velocity]
+
+    返回: [B, T, 7] - [go_straight, turn_left, turn_right, u_turn, velocity, acceleration, yaw_rate]
+        在所有temporal位置replicate相同的向量
+    """
+    B, T, _ = states.shape
+
+    # 1. Drive command (基于首尾yaw差分类)
+    yaw = states[:, :, 5]  # [B, T]
+    yaw_start = yaw[:, 0]
+    yaw_end = yaw[:, -1]
+    delta_yaw = torch.atan2(torch.sin(yaw_end - yaw_start), torch.cos(yaw_end - yaw_start))
+
+    abs_delta = torch.abs(delta_yaw)
+    go_straight = (abs_delta < straight_thresh).float()
+    turn_left = ((delta_yaw > straight_thresh) & (abs_delta < uturn_thresh)).float()
+    turn_right = ((delta_yaw < -straight_thresh) & (abs_delta < uturn_thresh)).float()
+    u_turn = (abs_delta >= uturn_thresh).float()
+
+    # 2. Current state features (从已观测帧提取)
+    velocity = states[:, 0, 6]  # [B]
+    if T >= 2:
+        acceleration = states[:, 1, 6] - states[:, 0, 6]  # [B]
+        yaw_rate = torch.atan2(
+            torch.sin(states[:, 1, 5] - states[:, 0, 5]),
+            torch.cos(states[:, 1, 5] - states[:, 0, 5])
+        )  # [B]
+    else:
+        acceleration = torch.zeros_like(velocity)
+        yaw_rate = torch.zeros_like(velocity)
+
+    # 3. Combine: [drive_cmd(4) + velocity(1) + acceleration(1) + yaw_rate(1)] = 7
+    state_vec = torch.stack([
+        go_straight, turn_left, turn_right, u_turn,
+        velocity, acceleration, yaw_rate
+    ], dim=-1)  # [B, 7]
+
+    # 4. Replicate across all temporal positions
+    return state_vec.unsqueeze(1).expand(B, T, 7).contiguous()  # [B, T, 7]
+
+
+def mask_future_actions(actions, num_known_actions):
+    """
+    将未来actions置零，只保留已知的historical actions。
+
+    actions: [B, T, 7]
+    num_known_actions: 已知action数（= num_observed_frames - 1）
+
+    返回: [B, T, 7] 前num_known_actions个保持不变，其余为0
+    """
+    masked = torch.zeros_like(actions)
+    if num_known_actions > 0:
+        n = min(num_known_actions, actions.shape[1])
+        masked[:, :n] = actions[:, :n]
+    return masked
+
+
 def prepare_status_feature(states, actions, mode: str = "first", use_drive_command: bool = False,
                            use_states_for_planner: bool = False, action_dim: int = 7,
                            straight_thresh: float = 0.3, uturn_thresh: float = 2.5):
@@ -1269,6 +1333,8 @@ def main(args, resume_preempt=False):
         logger.warning("use_drive_command_for_predictor=True overrides use_states_for_predictor; setting use_states_for_predictor=False")
         use_states_for_predictor = False
     action_dim = cfgs_train.get("action_dim", 7)  # action 维度: 7 (机器人) 或 4 (自动驾驶)
+    predictor_inference_consistent = cfgs_train.get("predictor_inference_consistent", False)  # 推理一致模式：drive_command+current_state作为states，未来action置零
+    num_observed_frames = cfgs_train.get("num_observed_frames", 2)  # 推理时可观测的帧数（用于确定已知action数）
     # -- EMA
     cfgs_ema = args.get("ema")
     # EMA 动态 momentum 范围: [start, end], 从小到大逐渐增加
@@ -1803,7 +1869,9 @@ def main(args, resume_preempt=False):
     logger.info(f"Trainable Parameters Summary:")
     logger.info(f"  encoder:           {sum(p.numel() for p in encoder.parameters() if p.requires_grad) / 1e6:>8.2f}M")
     # 显示predictor的states输入模式
-    if use_drive_command_for_predictor:
+    if predictor_inference_consistent:
+        predictor_state_mode = f"inference_consistent(drive_cmd+current_state, mask_future_actions, observed={num_observed_frames})"
+    elif use_drive_command_for_predictor:
         predictor_state_mode = "drive_command"
     elif use_states_for_predictor:
         predictor_state_mode = "states"
@@ -2146,9 +2214,23 @@ def main(args, resume_preempt=False):
 
                 def forward_predictions(z, actions, states, extrinsics):
                     """Predictor前向传播，支持控制是否使用states或drive_command"""
+
+                    # 推理一致模式：预先从完整states计算一次inference_consistent_states
+                    # drive_command基于整段轨迹首尾yaw差，必须用完整states计算
+                    if predictor_inference_consistent:
+                        _ic_states_full = prepare_inference_consistent_states(states)  # [B, T, 7]
+                        num_known_actions = num_observed_frames - 1
+                    else:
+                        _ic_states_full = None
+                        num_known_actions = actions.shape[1]
+
                     def _step_predictor(_z, _a, _s, _e):
                         # 根据配置决定输入类型
-                        if use_drive_command_for_predictor:
+                        if predictor_inference_consistent:
+                            # 从预计算的inference_consistent_states中截取对应长度
+                            T_needed = _s.shape[1]
+                            _states_input = _ic_states_full[:, :T_needed]
+                        elif use_drive_command_for_predictor:
                             # 使用drive_command替代states
                             _states_input = compute_drive_command(_s)
                         elif use_states_for_predictor:
@@ -2159,8 +2241,13 @@ def main(args, resume_preempt=False):
                         if normalize_reps:
                             _z = F.layer_norm(_z, (_z.size(-1),))
                         return _z
+
                     # Teacher forcing
-                    _z, _a, _s, _e = z[:, :-tokens_per_frame], actions, states[:, :-1], extrinsics[:, :-1]
+                    _z, _s, _e = z[:, :-tokens_per_frame], states[:, :-1], extrinsics[:, :-1]
+                    if predictor_inference_consistent:
+                        _a = mask_future_actions(actions, num_known_actions)
+                    else:
+                        _a = actions
                     z_tf = _step_predictor(_z, _a, _s, _e)
 
                     # Autoregressive rollout
@@ -2169,9 +2256,15 @@ def main(args, resume_preempt=False):
 
                     for k in range(1, num_prediction_steps):
                         if k == num_prediction_steps - 1:
-                            _a, _s, _e = actions, states[:, :-1], extrinsics[:, :-1]
+                            _a_full, _s, _e = actions, states[:, :-1], extrinsics[:, :-1]
                         else:
-                            _a, _s, _e = actions[:, :k+1], states[:, :k+1], extrinsics[:, :k+1]
+                            _a_full, _s, _e = actions[:, :k+1], states[:, :k+1], extrinsics[:, :k+1]
+
+                        if predictor_inference_consistent:
+                            _a = mask_future_actions(_a_full, num_known_actions)
+                        else:
+                            _a = _a_full
+
                         _z_nxt = _step_predictor(_z, _a, _s, _e)[:, -tokens_per_frame:]
                         _z = torch.cat([_z, _z_nxt], dim=1)
 
