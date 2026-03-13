@@ -849,14 +849,19 @@ def l1_length_normalized_loss(pred, gt, alpha=5.0, eps=1e-6):
     return (w * per_sample_l1).mean()
 
 
-def prepare_inference_consistent_states(states, straight_thresh=0.3, uturn_thresh=2.5):
+def prepare_inference_consistent_states(states, num_observed=2, straight_thresh=0.3, uturn_thresh=2.5):
     """
     构建推理一致的state输入：drive_command + current_state_features
 
     训练时从GT states计算，推理时drive_command由导航系统提供、state特征由传感器提供。
     两者格式完全一致，消除train/inference gap。
 
-    states: [B, T, 7] - [x, y, z, roll, pitch, yaw, velocity]
+    所有特征仅使用 observed 范围内的状态（states[:, :num_observed]），
+    不触及未来tubelet的GT信息。
+
+    Args:
+        states: [B, T, 7] - [x, y, z, roll, pitch, yaw, velocity]
+        num_observed: 已观测的tubelet数量（推理时encoder输出的tubelet数）
 
     返回: [B, T, 7] - [go_straight, turn_left, turn_right, u_turn, velocity, acceleration, yaw_rate]
         在所有temporal位置replicate相同的向量
@@ -864,6 +869,8 @@ def prepare_inference_consistent_states(states, straight_thresh=0.3, uturn_thres
     B, T, _ = states.shape
 
     # 1. Drive command (基于首尾yaw差分类)
+    #    训练时：从GT轨迹首尾yaw差反算
+    #    推理时：由导航系统直接提供
     yaw = states[:, :, 5]  # [B, T]
     yaw_start = yaw[:, 0]
     yaw_end = yaw[:, -1]
@@ -875,17 +882,19 @@ def prepare_inference_consistent_states(states, straight_thresh=0.3, uturn_thres
     turn_right = ((delta_yaw < -straight_thresh) & (abs_delta < uturn_thresh)).float()
     u_turn = (abs_delta >= uturn_thresh).float()
 
-    # 2. Current state features (从已观测帧提取)
-    velocity = states[:, 0, 6]  # [B]
-    if T >= 2:
-        acceleration = states[:, 1, 6] - states[:, 0, 6]  # [B]
+    # 2. Current state features — 仅使用observed范围内的状态（无信息泄露）
+    #    velocity: 最后一个observed tubelet的速度
+    velocity = states[:, num_observed - 1, 6]  # [B]
+    if num_observed >= 2:
+        # acceleration/yaw_rate: observed范围内的差分
+        acceleration = states[:, num_observed - 1, 6] - states[:, num_observed - 2, 6]  # [B]
         yaw_rate = torch.atan2(
-            torch.sin(states[:, 1, 5] - states[:, 0, 5]),
-            torch.cos(states[:, 1, 5] - states[:, 0, 5])
+            torch.sin(states[:, num_observed - 1, 5] - states[:, num_observed - 2, 5]),
+            torch.cos(states[:, num_observed - 1, 5] - states[:, num_observed - 2, 5])
         )  # [B]
     else:
-        acceleration = torch.zeros_like(velocity)
-        yaw_rate = torch.zeros_like(velocity)
+        acceleration = torch.zeros(B, device=states.device, dtype=states.dtype)
+        yaw_rate = torch.zeros(B, device=states.device, dtype=states.dtype)
 
     # 3. Combine: [drive_cmd(4) + velocity(1) + acceleration(1) + yaw_rate(1)] = 7
     state_vec = torch.stack([
@@ -1870,7 +1879,7 @@ def main(args, resume_preempt=False):
     logger.info(f"  encoder:           {sum(p.numel() for p in encoder.parameters() if p.requires_grad) / 1e6:>8.2f}M")
     # 显示predictor的states输入模式
     if predictor_inference_consistent:
-        predictor_state_mode = f"inference_consistent(drive_cmd+current_state, mask_future_actions, observed={num_observed_frames})"
+        predictor_state_mode = f"inference_consistent(drive_cmd+current_state, observed_tubelets={num_observed_frames}, known_actions={num_observed_frames - 1})"
     elif use_drive_command_for_predictor:
         predictor_state_mode = "drive_command"
     elif use_states_for_predictor:
@@ -2218,11 +2227,15 @@ def main(args, resume_preempt=False):
                     # 推理一致模式：预先从完整states计算一次inference_consistent_states
                     # drive_command基于整段轨迹首尾yaw差，必须用完整states计算
                     if predictor_inference_consistent:
-                        _ic_states_full = prepare_inference_consistent_states(states)  # [B, T, 7]
-                        num_known_actions = num_observed_frames - 1
+                        num_obs = num_observed_frames  # observed tubelets数
+                        num_known = num_obs - 1        # observed tubelets间的已知action数
+                        _ic_states_full = prepare_inference_consistent_states(
+                            states, num_observed=num_obs
+                        )  # [B, T, 7]
                     else:
+                        num_obs = 1
+                        num_known = actions.shape[1]
                         _ic_states_full = None
-                        num_known_actions = actions.shape[1]
 
                     def _step_predictor(_z, _a, _s, _e):
                         # 根据配置决定输入类型
@@ -2242,53 +2255,71 @@ def main(args, resume_preempt=False):
                             _z = F.layer_norm(_z, (_z.size(-1),))
                         return _z
 
-                    # Teacher forcing
+                    # Teacher forcing（训练信号，actions/states做inference_consistent处理）
                     _z, _s, _e = z[:, :-tokens_per_frame], states[:, :-1], extrinsics[:, :-1]
                     if predictor_inference_consistent:
-                        _a = mask_future_actions(actions, num_known_actions)
+                        _a = mask_future_actions(actions, num_known)
                     else:
                         _a = actions
                     z_tf = _step_predictor(_z, _a, _s, _e)
 
                     # Autoregressive rollout
-                    _z = torch.cat([z[:, :tokens_per_frame], z_tf[:, :tokens_per_frame]], dim=1)
-                    num_prediction_steps = z.size()[1] // tokens_per_frame - 1
+                    num_total = z.size(1) // tokens_per_frame  # 总tubelet数
 
-                    for k in range(1, num_prediction_steps):
-                        if k == num_prediction_steps - 1:
+                    if predictor_inference_consistent:
+                        # 起点: num_obs个tubelets全部来自encoder（真实观测）
+                        _z = z[:, :num_obs * tokens_per_frame]
+                        start_step = num_obs
+                    else:
+                        # 原始逻辑: 1个encoder tubelet + 1个teacher-forced预测
+                        _z = torch.cat([z[:, :tokens_per_frame], z_tf[:, :tokens_per_frame]], dim=1)
+                        start_step = 2
+
+                    for k in range(start_step, num_total):
+                        if k == num_total - 1:
                             _a_full, _s, _e = actions, states[:, :-1], extrinsics[:, :-1]
                         else:
-                            _a_full, _s, _e = actions[:, :k+1], states[:, :k+1], extrinsics[:, :k+1]
+                            _a_full, _s, _e = actions[:, :k], states[:, :k], extrinsics[:, :k]
 
                         if predictor_inference_consistent:
-                            _a = mask_future_actions(_a_full, num_known_actions)
+                            _a = mask_future_actions(_a_full, num_known)
                         else:
                             _a = _a_full
 
                         _z_nxt = _step_predictor(_z, _a, _s, _e)[:, -tokens_per_frame:]
                         _z = torch.cat([_z, _z_nxt], dim=1)
 
-                    z_ar = _z[:, tokens_per_frame:]
+                    # z_ar: 仅包含预测部分（排除所有encoder输出）
+                    if predictor_inference_consistent:
+                        z_ar = _z[:, num_obs * tokens_per_frame:]
+                    else:
+                        z_ar = _z[:, tokens_per_frame:]
+
                     return z_tf, z_ar
 
-                def loss_fn(z, h):
-                    _h = h[:, tokens_per_frame : z.size(1) + tokens_per_frame]
+                def loss_fn(z, h, offset=tokens_per_frame):
+                    _h = h[:, offset : z.size(1) + offset]
                     return torch.mean(torch.abs(z - _h) ** loss_exp) / loss_exp
 
                 # ==================== Forward pass ====================
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
                     # 1. Teacher分支
                     h_target = forward_target(context_clips)
-                    
+
                     # 2. Student分支
                     z_context = forward_context(context_clips)
                     z_pred = z_context
                     # 3. Predictor分支
                     z_tf, z_ar = forward_predictions(z_pred, actions, states, extrinsics)
-                    
+
                     # 4. 计算JEPA损失
-                    sloss = loss_fn(z_ar, h_target)
-                    jloss = loss_fn(z_tf, h_target)
+                    # z_ar offset: inference_consistent模式下z_ar从num_obs开始，需对齐teacher target
+                    if predictor_inference_consistent:
+                        ar_offset = num_observed_frames * tokens_per_frame
+                    else:
+                        ar_offset = tokens_per_frame
+                    sloss = loss_fn(z_ar, h_target, offset=ar_offset)
+                    jloss = loss_fn(z_tf, h_target)  # teacher forcing offset不变
                     jepa_loss = jloss + sloss
 
                     # ==================== Planner ====================
